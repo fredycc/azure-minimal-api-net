@@ -10,6 +10,14 @@
 - [Technologies](#technologies)
 - [Project Structure](#project-structure)
 - [Infrastructure](#infrastructure)
+- [Git Setup & Publishing](#git-setup--publishing)
+  - [Inicializar Git](#1-inicializar-git)
+  - [Verificar archivos ignorados](#2-verificar-archivos-ignorados)
+  - [Primer commit](#3-primer-commit)
+  - [Publicar en GitHub](#4-publicar-en-github)
+  - [Consideraciones Públic vs Privado](#consideraciones-públic-vs-privado)
+  - [Seguridad — Archivos que NUNCA se commitean](#seguridad--archivos-que-nunca-se-commitean)
+  - [Flujo de trabajo diario](#flujo-de-trabajo-diario)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [First-time Setup](#first-time-setup)
@@ -244,6 +252,139 @@ azure-minimal-api-net/
 | Log Analytics | $2–5 | $2–5 |
 | Key Vault | $3 | $3 |
 | **Total** | **~$10/mes** | **~$15–20/mes** |
+
+---
+
+## Git Setup & Publishing
+
+### 1. Inicializar Git
+
+```bash
+# Inicializar el repositorio local
+git init
+
+# Crear rama principal (en vez de "master")
+git checkout -b main
+```
+
+### 2. Verificar archivos ignorados
+
+El proyecto ya incluye `.gitignore` configurado para excluir:
+
+| Archivo/Carpeta | Razón |
+|-----------------|-------|
+| `bin/`, `obj/` | Build artifacts de .NET |
+| `.vs/` | Config de Visual Studio |
+| `infra/Pulumi.dev.yaml` | Contiene secrets encriptados (SQL password) |
+| `appsettings.Development.json` | Config local de desarrollo |
+| `.env` | Variables de entorno locales |
+
+> **Archivos `.example`:** El proyecto incluye versiones `.example` de las configs sensibles con documentación de cada variable. Ver: `infra/Pulumi.dev.yaml.example`, `src/Doctors.Api/appsettings.Development.example.json`, `.env.example`
+
+### 3. Primer commit
+
+```bash
+git add .
+git commit -m "feat: initial commit — azure minimal api with clean architecture"
+```
+
+### 4. Publicar en GitHub
+
+#### Opción A: Repo Público (cualquiera puede ver el código)
+
+```bash
+# Crear repo público + push
+gh repo create azure-minimal-api-net \
+  --public \
+  --source=. \
+  --remote=origin \
+  --push \
+  --description "CRUD API for specialist doctors — .NET 10, Clean Architecture, Azure Container Apps"
+
+# O si ya tenés el repo creado en GitHub:
+git remote add origin https://github.com/TU_USUARIO/azure-minimal-api-net.git
+git push -u origin main
+```
+
+#### Opción B: Repo Privado (solo vos y colaboradores invitados)
+
+```bash
+# Crear repo privado + push
+gh repo create azure-minimal-api-net \
+  --private \
+  --source=. \
+  --remote=origin \
+  --push \
+  --description "CRUD API for specialist doctors — .NET 10, Clean Architecture, Azure Container Apps"
+
+# O manual:
+git remote add origin https://github.com/TU_USUARIO/azure-minimal-api-net.git
+git push -u origin main
+```
+
+### 5. Configurar colaboradores (solo repos privados)
+
+```bash
+# Agregar colaborador
+gh api repos/TU_USUARIO/azure-minimal-api-net/collaborators/COLABORADOR \
+  --method PUT \
+  -f permission=push
+
+# Ver permisos actuales
+gh api repos/TU_USUARIO/azure-minimal-api-net/collaborators --jq '.[].login'
+```
+
+### Consideraciones Públic vs Privado
+
+| Aspecto | Público | Privado |
+|---------|---------|---------|
+| **Visibilidad** | Cualquiera puede ver el código | Solo colaboradores invitados |
+| **Secrets** | NUNCA subir `Pulumi.dev.yaml`, `.env`, keys | Más seguro, pero igual no subir secrets |
+| **Issues/PRs** | Abiertos a la comunidad | Solo colaboradores |
+| **Costo** | Gratis (GitHub) | Gratis para uso personal |
+| **Colaboración** | Fork + Pull Request | Invitar directamente |
+| **Uso recomendado** | Open source, demos, portfolio | Proyectos internos, clientes |
+
+### Seguridad — Archivos que NUNCA se commitean
+
+```bash
+# Verificar que NO estén en el repo (el .gitignore los excluye)
+git status  # No deberían aparecer:
+
+# ✗ infra/Pulumi.dev.yaml       → secrets de Pulumi
+# ✗ .env                        → variables de entorno
+# ✗ appsettings.Development.json → config local
+# ✗ launchSettings.json         → URLs locales
+```
+
+**Si accidentalmente commiteaste un secret:**
+
+```bash
+# Remover del historial (ANTES de hacer push)
+git rm --cached infra/Pulumi.dev.yaml
+git commit --amend --no-edit
+
+# Si ya hiciste push — rotar el secret INMEDIATAMENTE
+pulumi config set sqlPassword "NUEVO_PASSWORD" --secret
+```
+
+### Flujo de trabajo diario
+
+```bash
+# Antes de trabajar: traer cambios
+git pull origin main
+
+# Después de hacer cambios: crear branch
+git checkout -b feature/nueva-funcionalidad
+
+# Commitear
+git add .
+git commit -m "feat: descripción del cambio"
+
+# Push y crear Pull Request
+git push origin feature/nueva-funcionalidad
+gh pr create --title "feat: nueva funcionalidad" --body "Descripción del cambio"
+```
 
 ---
 
