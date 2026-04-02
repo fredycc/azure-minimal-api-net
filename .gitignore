@@ -1,0 +1,50 @@
+## .NET
+bin/
+obj/
+*.user
+*.sln.user
+*.userosscache
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+.vs/
+*.rsuser
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+bld/
+[Bb]uild/
+
+## NuGet
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nupkg
+**/packages/repositories.config
+project.lock.json
+project.fragment.lock.json
+
+## IDE
+.idea/
+*.sln.iml
+.vscode/
+*.swp
+*~
+
+## OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+## Pulumi (secrets)
+infra/Pulumi.dev.yaml
+infra/bin/
+
+## Environment
+.env
+*.env.local
+appsettings.Development.json

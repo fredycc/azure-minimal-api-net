@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+**/.git/
+**/.vs/
+**/*.sln.user
+**/*.user
+**/.DS_Store
+infra/
+Pulumi.dev.yaml

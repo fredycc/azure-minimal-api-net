@@ -1,0 +1,3 @@
+name: doctors-api-infra
+runtime: dotnet
+description: Infrastructure for the Specialist Doctors CRUD API
