@@ -48,3 +48,8 @@ infra/bin/
 .env
 *.env.local
 appsettings.Development.json
+
+## Agent Tools
+build.log
+.atl/
+sdd/
