@@ -591,44 +591,28 @@ az group delete --name rg-doctors-api-dev --yes --no-wait
 
 # Wait for completion (may take 2-5 minutes)
 az group show --name rg-doctors-api-dev  # ResourceNotFound = done
-
-# Clean Pulumi state (resources no longer exist)
-pulumi stack export --cwd infra | Out-Null  # Refresh state
 ```
 
 > **Difference:** `pulumi destroy` is surgical (deletes only Pulumi-managed resources).
 > `az group delete` is nuclear (deletes EVERYTHING in the group, including manual resources).
 
-#### After destroying: Recreate from scratch
+#### Recreate after destroy
+
+The infrastructure code handles destroy+recreate cleanly (dynamic KV secret names,
+base image for Container App, ACR admin enabled by default). Same as first-time setup:
 
 ```powershell
-# 1. Purge Key Vault (if it went to soft-delete)
-az keyvault purge --name kv-doctors-api-dev --location westus2 --no-wait
-
-# 2. Enable ACR admin (if ACR survived the destroy)
-az acr update -n acrdoctorsapidev --admin-enabled true 2>$null
-
-# 3. Build and push image (if ACR survived)
-docker build -t acrdoctorsapidev.azurecr.io/doctors-api:latest .
-az acr login --name acrdoctorsapidev
-docker push acrdoctorsapidev.azurecr.io/doctors-api:latest
-
-# 4. Full deploy
-.\deploy.ps1
+pulumi up --cwd infra --yes   # Create infrastructure
+.\deploy.ps1                  # Build, push, and deploy the app
 ```
 
-#### If Pulumi state is corrupted
-
-```powershell
-# Full state reset (Azure resources stay intact)
-pulumi stack export --cwd infra > backup.json  # Backup just in case
-pulumi state delete --all --cwd infra --yes     # Delete everything from state
-
-# Pulumi will "adopt" existing resources on next `pulumi up`
-pulumi up --cwd infra --yes
-```
-
-> ⚠️ **Warning:** `pulumi state delete --all` removes EVERYTHING from state.
+> **If Pulumi state is corrupted** (resources exist in Azure but state is broken):
+> ```powershell
+> pulumi stack export --cwd infra > backup.json   # Backup just in case
+> pulumi state delete --all --cwd infra --yes      # Clear state
+> pulumi up --cwd infra --yes                      # Re-adopt resources
+> ```
+> ⚠️ `pulumi state delete --all` removes everything from state.
 > The next `pulumi up` will try to create resources that already exist → conflict errors.
 > Only use this if you want to recreate everything from scratch.
 
@@ -857,6 +841,27 @@ az keyvault list-deleted --query "[?name=='kv-doctors-api-dev']" -o table
 
 **Solution:** Already fixed in code. The `DiagnosticSetting` targets the database.
 
+#### Error: Key Vault 403 Forbidden — "Caller is not authorized to perform action"
+
+**Symptom:** `403 Forbidden` when Pulumi tries to create/read/delete secrets in Key Vault. Error mentions `ForbiddenByRbac`.
+
+**Cause:** The Key Vault has `EnableRbacAuthorization = true` but the user/service principal running Pulumi has no RBAC role assigned on the vault. The `KeyVaultSecretsUser` role was only assigned to the Container App's managed identity.
+
+**Solution:**
+```powershell
+# Assign "Key Vault Secrets Officer" to your user (allows create/delete secrets)
+$USER_ID = az ad signed-in-user show --query "id" -o tsv
+$KV_ID = az keyvault show --name kv-doctors-api-dev --resource-group rg-doctors-api-dev --query "id" -o tsv
+
+az role assignment create --role "Key Vault Secrets Officer" --assignee $USER_ID --scope $KV_ID
+
+# Wait 1-5 minutes for RBAC propagation, then retry
+Start-Sleep -Seconds 120
+pulumi destroy --cwd infra --yes
+```
+
+> **Tip:** For production, add this role assignment in `infra/Program.cs` so it's always present.
+
 #### Error: Pulumi `RoleDefinitionDoesNotExist`
 
 **Symptom:** `The specified role definition with ID '...' does not exist`.
@@ -919,6 +924,9 @@ pulumi stack output --cwd infra
 | **Key Vault purge timeout** | Azure replication delay | Use `--no-wait`, wait 2-3 min |
 | **`containerAppUrl` shows [secret]** | Configuration has registry creds | Use `LatestRevisionFqdn` |
 | **SQL diag categories at database level** | Server level only has metrics | `ResourceUri = sqlDatabase.Id` |
+| **KV Secret 409 Conflict on recreate** | Secret soft-delete retains name 90 days | Dynamic name: `sql-conn-{env}-{timestamp}` — each recreate gets a unique name |
+| **MANIFEST_UNKNOWN on fresh deploy** | ACR is empty after destroy+recreate | Use base image `mcr.microsoft.com/dotnet/aspnet:10.0`; `deploy.ps1` updates with real image |
+| **Key Vault 403 on destroy** | RBAC-enabled KV requires user role | `az role assignment create --role "Key Vault Secrets Officer" --assignee <user> --scope <kv-id>` |
 
 ---
 

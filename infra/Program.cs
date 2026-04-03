@@ -15,7 +15,7 @@
 // ║  5. Firewall Rules        ← Controla acceso al SQL Server               ║
 // ║  6. Container App Env     ← Entorno donde corren los containers         ║
 // ║  7. Key Vault             ← Almacena secrets (RBAC, no AccessPolicies)  ║
-// ║  8. KV Secret             ← Connection string de SQL                    ║
+// ║  8. KV Secret             ← Connection string (nombre dinámico)         ║
 // ║  9. Container App         ← Tu API .NET corriendo en containers         ║
 // ║ 10. Firewall Rule (CA)    ← Permite al Container App hablar con SQL     ║
 // ║ 11. RBAC Role Assignments ← AcrPull + KeyVaultSecretsUser              ║
@@ -247,22 +247,30 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
-    // 9. SQL CONNECTION STRING → KEY VAULT SECRET
+    // 9. SQL CONNECTION STRING → KEY VAULT SECRET (nombre dinámico)
     // =========================================================================
     //
     // La connection string se construye con Outputs de Pulumi (sqlServer.Name, etc).
     // Se guarda como secret en Key Vault para centralizar gestión de credenciales.
     //
-    // El Container App referencia este secret via SecretRef (no como plaintext env var).
+    // NOMBRE DINÁMICO: Los secrets de Key Vault tienen soft-delete de 90 días.
+    // Al destruir y recrear la infra, el nombre anterior sigue reservado.
+    // Usamos un timestamp para generar un nombre único en cada creación.
+    // Esto evita el error 409 Conflict sin necesidad de purge manual.
+    //
+    // El Pulumi resource name (sql-conn-dev) se mantiene fijo para el state.
+    // El Azure secret name cambia en cada recreate (sql-conn-dev-1712100000).
     //
     // Encrypt=True + Trust Server Certificate=False = obligatorio para Azure SQL.
     //
     var sqlConnectionString = Output.Format($"Server=tcp:{sqlServer.Name}.database.windows.net;Database={sqlDatabase.Name};User Id={sqlAdmin};Password={sqlPassword};Encrypt=True;Trust Server Certificate=False;");
+    var timestamp = Output.Create($"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}");
+    var sqlSecretName = Output.Format($"sql-conn-{env}-{timestamp}");
     var sqlConnectionStringSecret = new AzureNative.KeyVault.Secret($"sql-conn-{env}", new()
     {
         ResourceGroupName = resourceGroup.Name,
         VaultName = keyVault.Name,
-        SecretName = "sql-connection-string",
+        SecretName = sqlSecretName,
         Properties = new AzureNative.KeyVault.Inputs.SecretPropertiesArgs
         {
             Value = sqlConnectionString,
@@ -363,9 +371,16 @@ return await Pulumi.Deployment.RunAsync(() =>
                 new AzureNative.App.Inputs.ContainerArgs
                 {
                     Name = "doctors-api",
-                    // Imagen: {acr}.azurecr.io/doctors-api:{tag}
-                    // El tag viene de Pulumi config (default: "latest")
-                    Image = Output.Format($"{containerRegistry.Name}.azurecr.io/doctors-api:{imageTag}"),
+                    // Imagen por defecto: ASP.NET runtime de Microsoft (siempre existe).
+                    // deploy.ps1 reemplaza con la imagen real después del build+push.
+                    // Esto evita el error "MANIFEST_UNKNOWN" al recrear la infra desde cero
+                    // cuando el ACR está vacío.
+                    //
+                    // Para usar una imagen del ACR, ejecutar:
+                    //   pulumi config set imageTag "latest" --cwd infra
+                    //   deploy.ps1 -Tag "latest"
+                    //
+                    Image = "mcr.microsoft.com/dotnet/aspnet:10.0",
                     Resources = new AzureNative.App.Inputs.ContainerResourcesArgs
                     {
                         Cpu = 0.25,      // 0.25 vCPU — mínimo para Container Apps
