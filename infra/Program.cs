@@ -58,7 +58,6 @@ return await Pulumi.Deployment.RunAsync(() =>
     var location = config.Get("location") ?? "eastus";  // Región Azure (default: eastus)
     var clientConfig = AzureNative.Authorization.GetClientConfig.Invoke();
     var subscriptionId = clientConfig.Apply(c => c.SubscriptionId); // Para RBAC role definitions
-    var imageTag = config.Get("imageTag") ?? "latest";  // Tag de la imagen Docker a desplegar
 
     // =========================================================================
     // TAGS — Identifican recursos para cost tracking y organización
@@ -80,9 +79,9 @@ return await Pulumi.Deployment.RunAsync(() =>
     // Todos los recursos viven dentro de este grupo. Al borrarlo, se borra todo.
     // Naming: rg-{service}-{env}
     //
-    var resourceGroup = new AzureNative.Resources.ResourceGroup($"rg-doctors-api-{env}", new()
+    var resourceGroup = new AzureNative.Resources.ResourceGroup($"rg-doctors-{env}", new()
     {
-        ResourceGroupName = $"rg-doctors-api-{env}",
+        ResourceGroupName = $"rg-doctors-{env}",
         Location = location,
         Tags = tags,
     });
@@ -259,13 +258,13 @@ return await Pulumi.Deployment.RunAsync(() =>
     // Esto evita el error 409 Conflict sin necesidad de purge manual.
     //
     // El Pulumi resource name (sql-conn-dev) se mantiene fijo para el state.
-    // El Azure secret name cambia en cada recreate (sql-conn-dev-1712100000).
+    // El Azure secret name incluye la location para ser estable entre deploys
+    // pero único entre stacks/regiones (evita soft-delete conflict en recreate).
     //
     // Encrypt=True + Trust Server Certificate=False = obligatorio para Azure SQL.
     //
     var sqlConnectionString = Output.Format($"Server=tcp:{sqlServer.Name}.database.windows.net;Database={sqlDatabase.Name};User Id={sqlAdmin};Password={sqlPassword};Encrypt=True;Trust Server Certificate=False;");
-    var timestamp = Output.Create($"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}");
-    var sqlSecretName = Output.Format($"sql-conn-{env}-{timestamp}");
+    var sqlSecretName = Output.Format($"sql-conn-{env}-{location}");
     var sqlConnectionStringSecret = new AzureNative.KeyVault.Secret($"sql-conn-{env}", new()
     {
         ResourceGroupName = resourceGroup.Name,
@@ -278,197 +277,41 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
-    // 10. REGISTRY CREDENTIALS — Credenciales temporales del ACR
+    // 10. CONTAINER APP — Se crea via deploy.ps1 (az containerapp create)
     // =========================================================================
     //
-    // TEMPORAL: Se usa admin/password del ACR para el primer deploy.
-    // Después del primer deploy exitoso, se cambia a Managed Identity (AcrPull).
+    // El Container App NO se crea aquí porque necesita una imagen Docker
+    // que aún no existe cuando se corre pulumi up por primera vez.
     //
-    // La llamada a ListRegistryCredentials lee las credenciales admin del ACR
-    // y las pasa al Container App para poder hacer pull de imágenes.
+    // deploy.ps1 se encarga de:
+    //   1. Crear infra base con pulumi up
+    //   2. Build + Push de la imagen al ACR
+    //   3. Crear el Container App con az containerapp create
     //
-    var registryCredentials = Output.Tuple(containerRegistry.Name, resourceGroup.Name).Apply(args =>
-    {
-        var (acrName, rgName) = args;
-        var creds = AzureNative.ContainerRegistry.ListRegistryCredentials.Invoke(new()
-        {
-            RegistryName = acrName,
-            ResourceGroupName = rgName,
-        });
-        return creds;
-    });
+    // Esto evita:
+    //   - Errores de "imagen no encontrada" cuando el ACR está vacío
+    //   - Condiciones de carrera con el rol AcrPull
+    //   - Workarounds de MinReplicas=0
+    //
 
     // =========================================================================
-    // 11. CONTAINER APP — Tu API .NET corriendo en containers
+    // 11. RBAC: Key Vault Secrets Officer para el usuario que corre Pulumi
     // =========================================================================
     //
-    // Identity: SystemAssigned → Azure crea un Managed Identity automáticamente.
-    //   Este identity se usa para:
-    //   - Pull de imágenes del ACR (vía AcrPull role)
-    //   - Leer secrets del Key Vault (vía KeyVaultSecretsUser role)
+    // Sin este rol, el usuario no puede crear/borrar secrets en el Key Vault
+    // (porque EnableRbacAuthorization = true).
+    // Esto permite que Pulumi gestione secrets sin errores 403 Forbidden.
     //
-    // Ingress: External = true → la API es accesible desde internet.
-    //   TargetPort 8080 = puerto interno del container (definido en Dockerfile).
-    //
-    // Secrets:
-    //   - sql-connection-string: connection string (Value directo por ahora)
-    //   - registry-password: credencial del ACR (TEMPORAL)
-    //
-    // Registries: bloque para autenticar con ACR (TEMPORAL — se quita con AcrPull).
-    //
-    // Env:
-    //   - ASPNETCORE_ENVIRONMENT=Development: activa Swagger, errores detallados
-    //   - ConnectionStrings__DefaultConnection: referencia al secret del SQL
-    //
-    // Scale: 1-5 réplicas. En dev, con 1 réplica es suficiente.
-    //
-    var containerApp = new AzureNative.App.ContainerApp($"ca-doctors-api-{env}", new()
+    var kvSecretsOfficer = new AzureNative.Authorization.RoleAssignment($"kvadmin-{env}", new()
     {
-        ContainerAppName = $"ca-doctors-api-{env}",
-        ResourceGroupName = resourceGroup.Name,
-        Location = resourceGroup.Location,
-        ManagedEnvironmentId = containerAppEnvironment.Id,
-        Identity = new AzureNative.App.Inputs.ManagedServiceIdentityArgs
-        {
-            Type = "SystemAssigned",
-        },
-        Configuration = new AzureNative.App.Inputs.ConfigurationArgs
-        {
-            Ingress = new AzureNative.App.Inputs.IngressArgs
-            {
-                External = true,
-                TargetPort = 8080,
-            },
-            Secrets = new[]
-            {
-                new AzureNative.App.Inputs.SecretArgs
-                {
-                    Name = "sql-connection-string",
-                    Value = sqlConnectionString,
-                },
-                // TODO: Quitar registry-password después de cambiar a AcrPull
-                new AzureNative.App.Inputs.SecretArgs
-                {
-                    Name = "registry-password",
-                    Value = registryCredentials.Apply(c => c.Passwords[0].Value!),
-                },
-            },
-            // TODO: Quitar bloque Registries después de cambiar a AcrPull
-            Registries = new[]
-            {
-                new AzureNative.App.Inputs.RegistryCredentialsArgs
-                {
-                    Server = Output.Format($"{containerRegistry.Name}.azurecr.io"),
-                    Username = registryCredentials.Apply(c => c.Username!),
-                    PasswordSecretRef = "registry-password",
-                },
-            },
-        },
-        Template = new AzureNative.App.Inputs.TemplateArgs
-        {
-            Containers = new[]
-            {
-                new AzureNative.App.Inputs.ContainerArgs
-                {
-                    Name = "doctors-api",
-                    // Imagen por defecto: ASP.NET runtime de Microsoft (siempre existe).
-                    // deploy.ps1 reemplaza con la imagen real después del build+push.
-                    // Esto evita el error "MANIFEST_UNKNOWN" al recrear la infra desde cero
-                    // cuando el ACR está vacío.
-                    //
-                    // Para usar una imagen del ACR, ejecutar:
-                    //   pulumi config set imageTag "latest" --cwd infra
-                    //   deploy.ps1 -Tag "latest"
-                    //
-                    Image = "mcr.microsoft.com/dotnet/aspnet:10.0",
-                    Resources = new AzureNative.App.Inputs.ContainerResourcesArgs
-                    {
-                        Cpu = 0.25,      // 0.25 vCPU — mínimo para Container Apps
-                        Memory = "0.5Gi", // 512 MB — suficiente para .NET 10 minimal API
-                    },
-                    Env = new[]
-                    {
-                        new AzureNative.App.Inputs.EnvironmentVarArgs
-                        {
-                            Name = "ASPNETCORE_ENVIRONMENT",
-                            Value = "Development",
-                        },
-                        new AzureNative.App.Inputs.EnvironmentVarArgs
-                        {
-                            Name = "ConnectionStrings__DefaultConnection",
-                            // SecretRef referencia el secret definido arriba.
-                            // El valor real viene del secret "sql-connection-string",
-                            // no aparece como plaintext en variables de entorno.
-                            SecretRef = "sql-connection-string",
-                        },
-                    },
-                },
-            },
-            Scale = new AzureNative.App.Inputs.ScaleArgs
-            {
-                MinReplicas = 1,
-                MaxReplicas = 5,
-            },
-        },
-        Tags = tags,
-    });
-
-    // =========================================================================
-    // 12. FIREWALL RULE: AllowContainerApp — IP outbound del Container App
-    // =========================================================================
-    //
-    // PROBLEMA: El alias "AllowAzureServices" (0.0.0.0) NO cubre Container Apps.
-    // Container Apps usa IPs outbound dinámicas que son DIFERENTES a la IP
-    // estática del Environment (que es solo para ingress).
-    //
-    // SOLUCIÓN: Crear un firewall rule con la IP outbound real del Container App.
-    // containerApp.OutboundIpAddresses es un array de IPs (usualmente 1).
-    //
-    // NOTA: Este firewall rule DEBE ir DESPUÉS del Container App porque depende
-    // de containerApp.OutboundIpAddresses (output del Container App).
-    //
-    // Para producción: usar VNet + Private Endpoint en vez de firewall rules.
-    //
-    var caFirewallRule = new AzureNative.Sql.FirewallRule($"fw-allow-ca-{env}", new()
-    {
-        FirewallRuleName = "AllowContainerApp",
-        ServerName = sqlServer.Name,
-        ResourceGroupName = resourceGroup.Name,
-        StartIpAddress = containerApp.OutboundIpAddresses.Apply(ips => ips[0]),
-        EndIpAddress = containerApp.OutboundIpAddresses.Apply(ips => ips[0]),
-    });
-
-    // =========================================================================
-    // 13. RBAC ROLE ASSIGNMENTS — Permisos del Managed Identity
-    // =========================================================================
-    //
-    // AcrPull (7f951dda-4ed3-4680-a7ca-43fe172d538d):
-    //   Permite al Container App hacer pull de imágenes del ACR sin admin credentials.
-    //
-    // KeyVaultSecretsUser (4633458b-17de-408a-b874-0445c86b69e6):
-    //   Permite al Container App leer secrets del Key Vault.
-    //
-    // PrincipalType = "ServicePrincipal" porque Managed Identities se tratan
-    // como Service Principals internamente en Azure RBAC.
-    //
-    var acrPullRole = new AzureNative.Authorization.RoleAssignment($"acrpull-{env}", new()
-    {
-        PrincipalId = containerApp.Identity.Apply(i => i!.PrincipalId!),
-        PrincipalType = "ServicePrincipal",
-        RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"),
-        Scope = containerRegistry.Id,
-    });
-
-    var kvSecretsUserRole = new AzureNative.Authorization.RoleAssignment($"kvsecretsuser-{env}", new()
-    {
-        PrincipalId = containerApp.Identity.Apply(i => i!.PrincipalId!),
-        PrincipalType = "ServicePrincipal",
-        RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6"),
+        PrincipalId = clientConfig.Apply(c => c.ObjectId),
+        PrincipalType = "User",
+        RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/b86a8fe4-44ce-4948-aee5-eccb2c155cd7"),
         Scope = keyVault.Id,
     });
 
     // =========================================================================
-    // 14. DIAGNOSTIC SETTINGS — Logs → Log Analytics
+    // 12. DIAGNOSTIC SETTINGS — Logs → Log Analytics
     // =========================================================================
     //
     // SQL Database:
@@ -481,36 +324,40 @@ return await Pulumi.Deployment.RunAsync(() =>
     //
     // Los logs llegan al Log Analytics workspace y se pueden consultar con KQL.
     //
-    var sqlDiag = new AzureNative.Insights.DiagnosticSetting($"diag-sql-{env}", new()
+    var sqlDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-sql-{env}", new()
     {
+        // Nombre explícito → evita que Azure genere un nombre con sufijo aleatorio
+        // que causa conflictos 409 al recrear la infra
+        Name = $"diag-sql-{env}",
         ResourceUri = sqlDatabase.Id,
         WorkspaceId = logAnalytics.Id,
         Logs = new[]
         {
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "SQLInsights" },
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "AutomaticTuning" },
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreRuntimeStatistics" },
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreWaitStatistics" },
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "Errors" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "SQLInsights" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AutomaticTuning" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreRuntimeStatistics" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreWaitStatistics" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "Errors" },
         },
         Metrics = new[]
         {
-            new AzureNative.Insights.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
+            new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
         },
     });
 
-    var kvDiag = new AzureNative.Insights.DiagnosticSetting($"diag-kv-{env}", new()
+    var kvDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-kv-{env}", new()
     {
+        Name = $"diag-kv-{env}",
         ResourceUri = keyVault.Id,
         WorkspaceId = logAnalytics.Id,
         Logs = new[]
         {
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "AuditEvent" },
-            new AzureNative.Insights.Inputs.LogSettingsArgs { Enabled = true, Category = "AzurePolicyEvaluationDetails" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AuditEvent" },
+            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AzurePolicyEvaluationDetails" },
         },
         Metrics = new[]
         {
-            new AzureNative.Insights.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
+            new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
         },
     });
 
@@ -519,11 +366,12 @@ return await Pulumi.Deployment.RunAsync(() =>
     // =========================================================================
     //
     // pulumi stack output → muestra estos valores
+    // La URL del Container App no está disponible aquí porque
+    // el Container App se crea via deploy.ps1, no via Pulumi.
     //
     return new Dictionary<string, object?>
     {
         ["resourceGroupName"] = resourceGroup.Name,
-        ["containerAppPrincipalId"] = containerApp.Identity.Apply(i => i!.PrincipalId!),
-        ["containerAppUrl"] = Output.Format($"https://{containerApp.LatestRevisionFqdn}"),
+        ["acrName"] = containerRegistry.Name,
     };
 });

@@ -216,7 +216,7 @@ azure-minimal-api-net/
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  rg-doctors-api-dev                              Resource Group (westus2)   │
+│  rg-doctors-dev                                  Resource Group (westus2)   │
 │                                                                              │
 │  ├── acrdoctorsapidev                            Container Registry (Basic)  │
 │  │   ├── AdminUserEnabled: true (temporary)                                  │
@@ -231,38 +231,42 @@ azure-minimal-api-net/
 │  │   │   ├── MinCapacity: 0.5 vCores             ← Minimum when active       │
 │  │   │   ├── MaxSize: 2 GB                       ← Enough for dev            │
 │  │   │   └── diag-sql-dev → Log Analytics         ← Diagnostics (5 categories)│
-│  │   ├── fw-allow-azure (0.0.0.0–0.0.0.0)       ← AllowAzureServices        │
-│  │   └── fw-allow-ca (CA outbound IP)            ← Container App → SQL       │
+│  │   └── fw-allow-azure (0.0.0.0–0.0.0.0)       ← AllowAzureServices        │
 │  │                                                                          │
 │  ├── kv-doctors-api-dev                          Key Vault (RBAC mode)       │
 │  │   ├── EnableRbacAuthorization: true                                       │
 │  │   ├── sql-connection-string (secret)                                      │
+│  │   ├── kvadmin-dev → User (Key Vault Secrets Officer)                      │
 │  │   └── diag-kv-dev → Log Analytics             ← Audit logs                │
 │  │                                                                          │
-│  ├── cae-doctors-api-dev                         Container App Environment   │
-│  │   ├── StaticIp: ingress (public inbound IP)                               │
-│  │   └── ca-doctors-api-dev                      Container App (your API)    │
-│  │       ├── Identity: SystemAssigned (Managed Identity)                     │
-│  │       ├── AcrPull role → ACR                 ← Pull without admin creds   │
-│  │       ├── KeyVaultSecretsUser role → KV      ← Read secrets               │
-│  │       ├── Image: acrdoctorsapidev.azurecr.io/doctors-api:{imageTag}       │
-│  │       ├── Port: 8080                                                       │
-│  │       ├── Env:                                                              │
-│  │       │   ├── ASPNETCORE_ENVIRONMENT=Development                          │
-│  │       │   └── ConnectionStrings__DefaultConnection (secret ref)           │
-│  │       ├── Scale: 1–5 replicas (consumption)                               │
-│  │       └── OutboundIpAddresses: egress IP (≠ Environment StaticIp)        │
-│  │                                                                          │
+│  └── cae-doctors-api-dev                         Container App Environment   │
+│                                                                              │
 │  └── Tags: environment=dev, project=azure-minimal-api-net, managed-by=pulumi │
 │                                                                              │
 │  Outputs:                                                                    │
-│  ├── containerAppUrl: https://ca-doctors-api-dev--{rev}.{domain}            │
-│  ├── containerAppPrincipalId: {Managed Identity GUID}                        │
-│  └── resourceGroupName: rg-doctors-api-dev                                  │
+│  ├── acrName: acrdoctorsapidev                                               │
+│  └── resourceGroupName: rg-doctors-dev                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> **infra/Program.cs** is fully documented with 14 sections explaining architecture, each resource, security, and costs. Read the file to understand each decision.
+### Azure Resources (deploy.ps1 — Azure CLI)
+
+El Container App se crea via Azure CLI (no Pulumi) porque necesita la imagen
+Docker que aún no existe cuando se corre `pulumi up`.
+
+```
+  └── ca-doctors-api-dev                      Container App (creado por deploy.ps1)
+      ├── Image: acrdoctorsapidev.azurecr.io/doctors-api:{Tag}
+      ├── Port: 8080
+      ├── Registry: acrdoctorsapidev.azurecr.io (con credenciales admin)
+      ├── Env:
+      │   ├── ASPNETCORE_ENVIRONMENT=Development
+      │   └── ConnectionStrings__DefaultConnection (secretref → KV secret)
+      ├── Scale: 1–5 replicas
+      └── fw-allow-ca → SQL firewall rule (CA outbound IP)
+```
+
+> **infra/Program.cs** is fully documented with 12 sections explaining architecture, each resource, security, and costs. Read the file to understand each decision.
 
 ### Security Features
 
@@ -507,20 +511,25 @@ curl -X POST http://localhost:5000/api/doctors \
 **Using deploy.ps1 (recommended):**
 
 ```powershell
-# Full deploy (infra + build + push + update)
+# Full deploy (infra + build + push + container app creation)
 .\deploy.ps1
 
 # With specific tag
 .\deploy.ps1 -Tag "1.2.0"
 
-# The script includes pre-checks (Docker, Azure CLI, Pulumi)
-# and post-deploy verification (checks revision is healthy).
+# The script:
+#   1. Creates/updates infra via Pulumi (RG, ACR, SQL, KV, CAE, etc.)
+#   2. Builds Docker image
+#   3. Pushes to ACR
+#   4. Creates Container App via Azure CLI (with KV secret)
+#   5. Configures SQL firewall rule for Container App outbound IP
+#   6. Verifies API is responding
 ```
 
 **Manual (step by step):**
 
 ```powershell
-# 1. Create/update infrastructure
+# 1. Create/update infrastructure (no Container App)
 pulumi up --cwd infra --yes
 
 # 2. Build Docker image
@@ -530,11 +539,25 @@ docker build -t acrdoctorsapidev.azurecr.io/doctors-api:latest .
 az acr login --name acrdoctorsapidev
 docker push acrdoctorsapidev.azurecr.io/doctors-api:latest
 
-# 4. Update Container App (CRITICAL — without this, old image keeps running)
-az containerapp update --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --image acrdoctorsapidev.azurecr.io/doctors-api:latest
+# 4. Get KV secret
+$SQL_CONN = az keyvault secret show --vault-name kv-doctors-api-dev --name "sql-conn-dev-westus2" --query "value" -o tsv
 
-# 5. Get the URL
-az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query "properties.configuration.ingress.fqdn" -o tsv
+# 5. Create Container App
+az containerapp create `
+    --name ca-doctors-api-dev `
+    --resource-group rg-doctors-dev `
+    --environment cae-doctors-api-dev `
+    --image acrdoctorsapidev.azurecr.io/doctors-api:latest `
+    --target-port 8080 `
+    --ingress external `
+    --min-replicas 1 --max-replicas 5 `
+    --cpu 0.25 --memory "0.5Gi" `
+    --registry-server "acrdoctorsapidev.azurecr.io" `
+    --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" `
+    --secrets "sql-connection-string=$SQL_CONN"
+
+# 6. Get URL
+az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "properties.configuration.ingress.fqdn" -o tsv
 ```
 
 **Change image tag only (no infra changes):**
@@ -576,30 +599,33 @@ curl -X POST "$URL/api/doctors" `
 # Destroy all resources created by Pulumi
 pulumi destroy --cwd infra --yes
 
+# Purge Key Vault (soft-delete retains it for 90 days)
+az keyvault purge --name kv-doctors-api-dev --no-wait
+
 # Verify everything was deleted
-az group show --name rg-doctors-api-dev  # Should return ResourceNotFound
+az group show --name rg-doctors-dev  # Should return ResourceNotFound
 ```
 
 > `pulumi destroy` deletes resources from Azure AND removes them from Pulumi state.
-> This is the clean way to tear down.
+> Key Vault needs a separate purge because of Azure soft-delete policy.
 
 #### Option 2: Delete the Resource Group (faster, less clean)
 
 ```powershell
 # ⚠️ THIS DELETES EVERYTHING — including resources Pulumi doesn't manage
-az group delete --name rg-doctors-api-dev --yes --no-wait
+az group delete --name rg-doctors-dev --yes --no-wait
+
+# Purge Key Vault
+az keyvault purge --name kv-doctors-api-dev --no-wait
 
 # Wait for completion (may take 2-5 minutes)
-az group show --name rg-doctors-api-dev  # ResourceNotFound = done
+az group show --name rg-doctors-dev  # ResourceNotFound = done
 ```
 
 > **Difference:** `pulumi destroy` is surgical (deletes only Pulumi-managed resources).
 > `az group delete` is nuclear (deletes EVERYTHING in the group, including manual resources).
 
 #### Recreate after destroy
-
-The infrastructure code handles destroy+recreate cleanly (dynamic KV secret names,
-base image for Container App, ACR admin enabled by default). Same as first-time setup:
 
 ```powershell
 pulumi up --cwd infra --yes   # Create infrastructure
@@ -608,13 +634,11 @@ pulumi up --cwd infra --yes   # Create infrastructure
 
 > **If Pulumi state is corrupted** (resources exist in Azure but state is broken):
 > ```powershell
-> pulumi stack export --cwd infra > backup.json   # Backup just in case
 > pulumi state delete --all --cwd infra --yes      # Clear state
-> pulumi up --cwd infra --yes                      # Re-adopt resources
+> az group delete --name rg-doctors-dev --yes      # Delete old resources
+> az keyvault purge --name kv-doctors-api-dev      # Purge soft-deleted KV
+> pulumi up --cwd infra --yes                      # Create fresh
 > ```
-> ⚠️ `pulumi state delete --all` removes everything from state.
-> The next `pulumi up` will try to create resources that already exist → conflict errors.
-> Only use this if you want to recreate everything from scratch.
 
 ---
 
@@ -700,16 +724,16 @@ config:
 
 ```powershell
 # Check Container App status
-az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query "{status: properties.runningStatus, revision: properties.latestRevisionName, fqdn: properties.configuration.ingress.fqdn}" -o table
+az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "{status: properties.runningStatus, revision: properties.latestRevisionName, fqdn: properties.configuration.ingress.fqdn}" -o table
 
 # Check revision status
-az containerapp revision list --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query "[].{name: name, active: properties.active, health: properties.healthState}" -o table
+az containerapp revision list --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "[].{name: name, active: properties.active, health: properties.healthState}" -o table
 
 # Check container logs (last 30 lines)
-az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --type console --tail 30
+az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-dev --type console --tail 30
 
 # Check system logs (infrastructure errors)
-az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --type system --tail 20
+az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-dev --type system --tail 20
 ```
 
 ### Common Errors and Solutions
@@ -723,13 +747,13 @@ az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-
 **Solution:**
 ```powershell
 # 1. Check Container App outbound IP
-az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query "properties.outboundIpAddresses" -o tsv
+az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "properties.outboundIpAddresses" -o tsv
 
 # 2. Check current firewall rules
-az sql server firewall-rule list --server sql-doctors-api-dev --resource-group rg-doctors-api-dev -o table
+az sql server firewall-rule list --server sql-doctors-api-dev --resource-group rg-doctors-dev -o table
 
-# 3. If the IP is missing, the firewall rule is auto-created on next `pulumi up`
-pulumi up --cwd infra --yes
+# 3. If the IP is missing, re-run deploy.ps1 to create the firewall rule
+.\deploy.ps1
 ```
 
 #### Error: Pulumi "ResourceNotFound" — Key Vault or Container App doesn't exist
@@ -771,10 +795,10 @@ pulumi up --cwd infra --yes
 az acr repository show-tags --name acrdoctorsapidev --repository doctors-api -o table
 
 # Check container console logs (shows actual .NET error)
-az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --type console --tail 30
+az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-dev --type console --tail 30
 
 # Restart current revision
-az containerapp revision restart --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --revision <revision-name>
+az containerapp revision restart --name ca-doctors-api-dev --resource-group rg-doctors-dev --revision <revision-name>
 ```
 
 #### Error: `MANIFEST_UNKNOWN` — image not found in ACR
@@ -851,7 +875,7 @@ az keyvault list-deleted --query "[?name=='kv-doctors-api-dev']" -o table
 ```powershell
 # Assign "Key Vault Secrets Officer" to your user (allows create/delete secrets)
 $USER_ID = az ad signed-in-user show --query "id" -o tsv
-$KV_ID = az keyvault show --name kv-doctors-api-dev --resource-group rg-doctors-api-dev --query "id" -o tsv
+$KV_ID = az keyvault show --name kv-doctors-api-dev --resource-group rg-doctors-dev --query "id" -o tsv
 
 az role assignment create --role "Key Vault Secrets Officer" --assignee $USER_ID --scope $KV_ID
 
@@ -880,27 +904,27 @@ pulumi destroy --cwd infra --yes
 
 **Solution:**
 ```powershell
-az containerapp update --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --image acrdoctorsapidev.azurecr.io/doctors-api:latest
+az containerapp update --name ca-doctors-api-dev --resource-group rg-doctors-dev --image acrdoctorsapidev.azurecr.io/doctors-api:latest
 ```
 
 ### Verify All Resources
 
 ```powershell
 # Resource Group
-az group show --name rg-doctors-api-dev --query "{name: name, location: location, tags: tags}" -o table
+az group show --name rg-doctors-dev --query "{name: name, location: location, tags: tags}" -o table
 
 # ACR
 az acr show --name acrdoctorsapidev --query "{name: name, tier: sku.tier, adminEnabled: adminUserEnabled}" -o table
 
 # SQL
-az sql server show --name sql-doctors-api-dev --resource-group rg-doctors-api-dev --query "{name: name, version: version}" -o table
-az sql db show --name sqldb-doctors-dev --server sql-doctors-api-dev --resource-group rg-doctors-api-dev --query "{name: name, status: status, maxSize: maxSizeBytes}" -o table
+az sql server show --name sql-doctors-api-dev --resource-group rg-doctors-dev --query "{name: name, version: version}" -o table
+az sql db show --name sqldb-doctors-dev --server sql-doctors-api-dev --resource-group rg-doctors-dev --query "{name: name, status: status, maxSize: maxSizeBytes}" -o table
 
 # Key Vault
 az keyvault show --name kv-doctors-api-dev --query "{name: name, rbacEnabled: properties.enableRbacAuthorization}" -o table
 
 # Container App
-az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query "{name: name, status: properties.runningStatus, fqdn: properties.configuration.ingress.fqdn}" -o table
+az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "{name: name, status: properties.runningStatus, fqdn: properties.configuration.ingress.fqdn}" -o table
 
 # Pulumi outputs
 pulumi stack output --cwd infra
@@ -922,11 +946,13 @@ pulumi stack output --cwd infra
 | **SQL firewall blocks Container App** | `AllowAzureServices` doesn't cover CA | Firewall rule with CA outbound IP |
 | **EF migrations fail outside DI** | No provider configured | Use `IDesignTimeDbContextFactory` |
 | **Key Vault purge timeout** | Azure replication delay | Use `--no-wait`, wait 2-3 min |
-| **`containerAppUrl` shows [secret]** | Configuration has registry creds | Use `LatestRevisionFqdn` |
 | **SQL diag categories at database level** | Server level only has metrics | `ResourceUri = sqlDatabase.Id` |
-| **KV Secret 409 Conflict on recreate** | Secret soft-delete retains name 90 days | Dynamic name: `sql-conn-{env}-{timestamp}` — each recreate gets a unique name |
-| **MANIFEST_UNKNOWN on fresh deploy** | ACR is empty after destroy+recreate | Use base image `mcr.microsoft.com/dotnet/aspnet:10.0`; `deploy.ps1` updates with real image |
-| **Key Vault 403 on destroy** | RBAC-enabled KV requires user role | `az role assignment create --role "Key Vault Secrets Officer" --assignee <user> --scope <kv-id>` |
+| **KV Secret 409 Conflict on recreate** | Secret soft-delete retains name 90 days | Dynamic name: `sql-conn-{env}-{location}` |
+| **Key Vault 403 on destroy** | RBAC-enabled KV requires user role | `az role assignment create --role "Key Vault Secrets Officer"` |
+| **Container App not created by Pulumi** | Image doesn't exist when Pulumi runs | Container App created via `deploy.ps1` after build+push |
+| **`az containerapp create` --secret-env-vars error** | Flag doesn't exist | Use `secretref:` prefix in `--env-vars` |
+| **Pulumi.AzureNative.Insights namespace missing** | Removed in v3.x | Use `AzureNative.Monitor` instead |
+| **Only 1 Container App Environment per region** | Azure subscription limit | Delete old CAE or use different region |
 
 ---
 
