@@ -294,6 +294,24 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
+    // 9b. JWT SIGNING KEY → KEY VAULT SECRET
+    // =========================================================================
+    //
+    // The signing key for JWT token validation in production.
+    // In dev, the key comes from appsettings.Development.json.
+    //
+    var jwtSigningKeySecret = new AzureNative.KeyVault.Secret($"jwt-signing-key-{env}", new()
+    {
+        ResourceGroupName = resourceGroup.Name,
+        VaultName = keyVault.Name,
+        SecretName = $"jwt-signing-key-{env}",
+        Properties = new AzureNative.KeyVault.Inputs.SecretPropertiesArgs
+        {
+            Value = config.RequireSecret("jwtSigningKey"),
+        },
+    });
+
+    // =========================================================================
     // 10. CONTAINER APP — Se crea via deploy.ps1 (az containerapp create)
     // =========================================================================
     //

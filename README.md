@@ -45,7 +45,9 @@
                          │        (Presentation Layer)         │
                          │                                     │
                          │  Program.cs     ← Composition Root  │
-                         │  Endpoints/     ← Route Handlers    │
+                         │  Endpoints/     ← Routes + Auth     │
+                         │  Services/      ← TokenService      │
+                         │  DTOs/          ← Request/Response  │
                          │  Filters/       ← Cross-cutting     │
                          │  Extensions/    ← ProblemDetails    │
                          └────────────────┬────────────────────┘
@@ -105,6 +107,7 @@
 | **ORM** | Entity Framework Core | 10.0 | Database access |
 | **Database** | Azure SQL Serverless | — | Serverless, auto-pause after 60min idle |
 | **Docs** | NSwag.AspNetCore | 14.6.3 | Swagger UI + OpenAPI spec |
+| **Auth** | Microsoft.AspNetCore.Authentication.JwtBearer | 10.0 | JWT Bearer auth with custom issuer |
 | **IaC** | Pulumi Azure Native | 3.x | Infrastructure as Code (C#) |
 | **Hosting** | Azure Container Apps | — | Serverless containers |
 | **Registry** | Azure Container Registry | — | Docker image storage |
@@ -175,9 +178,15 @@ azure-minimal-api-net/
 │   │   └── DependencyInjection.cs         # AddInfrastructure() extension
 │   │
 │   └── Doctors.Api/                      # ← Depends on Application + Infrastructure
-│       ├── Program.cs                     # Composition root
+│       ├── Program.cs                     # Composition root + JWT auth config
 │       ├── Endpoints/
-│       │   └── DoctorEndpoints.cs         # 5 CRUD route handlers
+│       │   ├── DoctorEndpoints.cs         # 5 CRUD route handlers (mutations require auth)
+│       │   └── AuthEndpoints.cs           # POST /auth/login → JWT token
+│       ├── Services/
+│       │   └── TokenService.cs            # JWT generation (HMAC-SHA256)
+│       ├── DTOs/
+│       │   ├── LoginRequest.cs            # Login request (Username, Password)
+│       │   └── TokenResponse.cs           # Login response (Token, ExpiresAt)
 │       ├── Filters/
 │       │   ├── LoggingFilter.cs           # Stopwatch-based request logging
 │       │   └── ValidationFilter.cs        # DataAnnotations validation
@@ -236,6 +245,7 @@ azure-minimal-api-net/
 │  ├── kv-doctors-api-dev                          Key Vault (RBAC mode)       │
 │  │   ├── EnableRbacAuthorization: true                                       │
 │  │   ├── sql-connection-string (secret)                                      │
+│  │   ├── jwt-signing-key-dev (secret) ← JWT token signing                   │
 │  │   ├── kvadmin-dev → User (Key Vault Secrets Officer)                      │
 │  │   └── diag-kv-dev → Log Analytics             ← Audit logs                │
 │  │                                                                          │
@@ -261,7 +271,11 @@ Docker que aún no existe cuando se corre `pulumi up`.
       ├── Registry: acrdoctorsapidev.azurecr.io (con credenciales admin)
       ├── Env:
       │   ├── ASPNETCORE_ENVIRONMENT=Development
-      │   └── ConnectionStrings__DefaultConnection (secretref → KV secret)
+      │   ├── ConnectionStrings__DefaultConnection (secretref → KV secret)
+      │   └── JwtSettings__SigningKey (secretref → KV secret)
+      ├── Secrets:
+      │   ├── sql-connection-string → KV sql-conn-dev-westus2
+      │   └── jwt-signing-key → KV jwt-signing-key-dev
       ├── Scale: 1–5 replicas
       └── fw-allow-ca → SQL firewall rule (CA outbound IP)
 ```
@@ -272,10 +286,13 @@ Docker que aún no existe cuando se corre `pulumi up`.
 
 | Feature | Implementation | Cost |
 |---------|---------------|------|
+| **JWT Authentication** | Custom issuer, HMAC-SHA256, 60min expiry | $0 |
+| **Endpoint Protection** | `.RequireAuthorization()` on POST/PUT/DELETE | $0 |
+| **Swagger Security** | NSwag Bearer scheme → Authorize button | $0 |
 | **Managed Identity** | SystemAssigned on Container App | $0 |
 | **ACR Pull via RBAC** | AcrPull role (no admin credentials) | $0 |
 | **Key Vault RBAC** | EnableRbacAuthorization = true | $0 |
-| **Secret Reference** | Connection string via SecretRef (no plaintext) | $0 |
+| **Secret Reference** | Connection string + JWT key via SecretRef (no plaintext) | $0 |
 | **Resource Tags** | environment, project, managed-by | $0 |
 | **DiagnosticSettings** | SQL + Key Vault → Log Analytics | ~$2-5/mo |
 | **SQL Firewall** | AllowAzureServices + Container App outbound IP | $0 |
@@ -469,6 +486,10 @@ pulumi config set imageTag latest
 # Set SQL password as encrypted secret
 pulumi config set --secret sqlPassword
 # → Enter a strong password: uppercase + lowercase + number + symbol, 8+ chars
+
+# Set JWT signing key as encrypted secret (≥ 32 characters)
+pulumi config set --secret jwtSigningKey
+# → Enter a strong random key, e.g.: openssl rand -base64 48
 ```
 
 **4. Purge old Key Vault (if exists from previous deployment)**
@@ -497,13 +518,24 @@ dotnet run --project src/Doctors.Api
 **Test the API:**
 
 ```bash
-# GET all (empty at first)
+# GET all (empty at first) — public, no auth needed
 curl http://localhost:5000/api/doctors
 
-# CREATE a doctor
+# Get a JWT token
+curl -s -X POST http://localhost:5000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq .token
+
+# CREATE a doctor (requires Bearer token)
 curl -X POST http://localhost:5000/api/doctors \
+  -H "Authorization: Bearer <your-token>" \
   -H "Content-Type: application/json" \
   -d '{"firstName":"Juan","lastName":"Pérez","licenseNumber":"MP-12345","specialty":"Cardiología"}'
+
+# Without token → 401 Unauthorized
+curl -X POST http://localhost:5000/api/doctors \
+  -H "Content-Type: application/json" \
+  -d '{"firstName":"Test"}'
 ```
 
 ### Deploy to Azure
@@ -539,8 +571,9 @@ docker build -t acrdoctorsapidev.azurecr.io/doctors-api:latest .
 az acr login --name acrdoctorsapidev
 docker push acrdoctorsapidev.azurecr.io/doctors-api:latest
 
-# 4. Get KV secret
+# 4. Get KV secrets
 $SQL_CONN = az keyvault secret show --vault-name kv-doctors-api-dev --name "sql-conn-dev-westus2" --query "value" -o tsv
+$JWT_KEY = az keyvault secret show --vault-name kv-doctors-api-dev --name "jwt-signing-key-dev" --query "value" -o tsv
 
 # 5. Create Container App
 az containerapp create `
@@ -553,8 +586,8 @@ az containerapp create `
     --min-replicas 1 --max-replicas 5 `
     --cpu 0.25 --memory "0.5Gi" `
     --registry-server "acrdoctorsapidev.azurecr.io" `
-    --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" `
-    --secrets "sql-connection-string=$SQL_CONN"
+    --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" "JwtSettings__SigningKey=secretref:jwt-signing-key" `
+    --secrets "sql-connection-string=$SQL_CONN" "jwt-signing-key=$JWT_KEY"
 
 # 6. Get URL
 az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "properties.configuration.ingress.fqdn" -o tsv
@@ -573,16 +606,27 @@ pulumi config set imageTag "v1.2.3" --cwd infra
 # Get current URL
 $URL = "https://$(az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query 'properties.configuration.ingress.fqdn' -o tsv)"
 
-# Health check
+# Health check (public endpoint)
 curl "$URL/api/doctors"
 
 # Swagger UI
 curl "$URL/swagger"
 
-# Create a doctor
+# Get auth token
+$TOKEN = (curl -s -X POST "$URL/auth/login" `
+  -H "Content-Type: application/json" `
+  -d '{"username":"admin","password":"admin123"}' | ConvertFrom-Json).token
+
+# Create a doctor (with auth)
 curl -X POST "$URL/api/doctors" `
+  -H "Authorization: Bearer $TOKEN" `
   -H "Content-Type: application/json" `
   -d '{"firstName":"María","lastName":"González","licenseNumber":"MP-67890","specialty":"Neurología"}'
+
+# Verify mutation without auth → 401
+curl -X POST "$URL/api/doctors" `
+  -H "Content-Type: application/json" `
+  -d '{"firstName":"Test"}'
 ```
 
 ### Destroy & Recreate Infrastructure
@@ -644,13 +688,43 @@ pulumi up --cwd infra --yes   # Create infrastructure
 
 ## API Endpoints
 
+### Authentication
+
 | Method | Path | Description | Request Body | Response |
 |--------|------|-------------|-------------|----------|
-| `GET` | `/api/doctors` | List all active doctors | — | `200` + `DoctorDto[]` |
-| `GET` | `/api/doctors/{id}` | Get doctor by ID | — | `200` + `DoctorDto` or `404` |
-| `POST` | `/api/doctors` | Create a doctor | `CreateDoctorRequest` | `201` + `DoctorDto` or `400`/`409` |
-| `PUT` | `/api/doctors/{id}` | Update a doctor | `UpdateDoctorRequest` | `200` + `DoctorDto` or `400`/`404` |
-| `DELETE` | `/api/doctors/{id}` | Soft-delete a doctor | — | `204` or `404` |
+| `POST` | `/auth/login` | Get JWT token | `LoginRequest` | `200` + `TokenResponse` or `401` |
+
+### Doctors (CRUD)
+
+| Method | Path | Description | Auth Required | Request Body | Response |
+|--------|------|-------------|:------------:|-------------|----------|
+| `GET` | `/api/doctors` | List all active doctors | ❌ No | — | `200` + `DoctorDto[]` |
+| `GET` | `/api/doctors/{id}` | Get doctor by ID | ❌ No | — | `200` + `DoctorDto` or `404` |
+| `POST` | `/api/doctors` | Create a doctor | ✅ Yes | `CreateDoctorRequest` | `201` + `DoctorDto` or `400`/`409` |
+| `PUT` | `/api/doctors/{id}` | Update a doctor | ✅ Yes | `UpdateDoctorRequest` | `200` + `DoctorDto` or `400`/`404` |
+| `DELETE` | `/api/doctors/{id}` | Soft-delete a doctor | ✅ Yes | — | `204` or `404` |
+
+> **Auth strategy**: JWT Bearer with Custom Issuer (HMAC-SHA256). Only mutations (POST, PUT, DELETE) require auth. GETs remain public for dev/demo convenience. Cloud-portable — no dependency on Entra ID or external IdP.
+
+### How to authenticate
+
+```bash
+# 1. Get a token (demo credentials: admin / admin123)
+curl -X POST http://localhost:5000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+
+# Response: {"token":"eyJhbG...","expiresAt":"2026-04-06T..."}
+
+# 2. Use the token for mutations
+curl -X POST http://localhost:5000/api/doctors \
+  -H "Authorization: Bearer eyJhbG..." \
+  -H "Content-Type: application/json" \
+  -d '{"firstName":"Juan","lastName":"Pérez","licenseNumber":"MP-12345","specialty":"Cardiología"}'
+
+# 3. GETs work without token
+curl http://localhost:5000/api/doctors
+```
 
 ### Request/Response Examples
 
@@ -694,12 +768,35 @@ pulumi up --cwd infra --yes   # Create infrastructure
 
 ## Configuration
 
+### JWT Settings (appsettings.Development.json)
+
+```json
+{
+  "JwtSettings": {
+    "Issuer": "doctors-api",
+    "Audience": "doctors-api",
+    "SigningKey": "doctors-api-dev-secret-key-min-32-chars-long!",
+    "ExpiryMinutes": 60
+  }
+}
+```
+
+| Field | Purpose | Default |
+|-------|---------|---------|
+| `Issuer` | Token issuer claim (validates where token came from) | `doctors-api` |
+| `Audience` | Token audience claim (validates intended recipient) | `doctors-api` |
+| `SigningKey` | HMAC-SHA256 symmetric key (≥ 32 chars) | Dev-only hardcoded |
+| `ExpiryMinutes` | Token lifetime | `60` |
+
+> **Production**: signing key stored in Azure Key Vault as `jwt-signing-key-dev` secret. `deploy.ps1` reads it and passes to Container App.
+
 ### Environment Variables (Container App)
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `ASPNETCORE_ENVIRONMENT` | `Development` | Enables Swagger/ReDoc |
-| `ConnectionStrings__DefaultConnection` | Secret ref → `sql-connection-string` | Azure SQL connection (via Container App secret) |
+| `ConnectionStrings__DefaultConnection` | Secret ref → `sql-connection-string` | Azure SQL connection |
+| `JwtSettings__SigningKey` | Secret ref → `jwt-signing-key` | JWT token signing (from Key Vault) |
 
 > **Note:** Use double underscore (`__`) not colon (`:`) for nested config in environment variables.
 
@@ -714,6 +811,8 @@ config:
   doctors-api-infra:imageTag: latest          # Docker image tag
   doctors-api-infra:sqlPassword:
     secure: <encrypted>
+  doctors-api-infra:jwtSigningKey:
+    secure: <encrypted>                       # JWT signing key (≥ 32 chars)
 ```
 
 ---

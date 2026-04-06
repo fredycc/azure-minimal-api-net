@@ -240,11 +240,17 @@ docker push $ImageName
 
 Write-Host "`n=== Step 5: Create Container App ===" -ForegroundColor Cyan
 
-# Obtener connection string del KV secret
+# Obtener secrets del Key Vault
 $sqlConnSecret = az keyvault secret show --vault-name $KvName --name "sql-conn-dev-westus2" --query "value" -o tsv 2>$null
+$jwtSigningKey = az keyvault secret show --vault-name $KvName --name "jwt-signing-key-dev" --query "value" -o tsv 2>$null
 
 if (-not $sqlConnSecret) {
     Write-Error "No se pudo obtener el connection string del Key Vault."
+    exit 1
+}
+
+if (-not $jwtSigningKey) {
+    Write-Error "No se pudo obtener el JWT signing key del Key Vault."
     exit 1
 }
 
@@ -306,8 +312,8 @@ else {
         --registry-server "$AcrName.azurecr.io" `
         --registry-identity system `
         --system-assigned `
-        --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" `
-        --secrets "sql-connection-string=$sqlConnSecret" `
+        --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" "JwtSettings__SigningKey=secretref:jwt-signing-key" `
+        --secrets "sql-connection-string=$sqlConnSecret" "jwt-signing-key=$jwtSigningKey" `
         --query "properties.provisioningState" -o tsv
 
     if ($LASTEXITCODE -ne 0) {

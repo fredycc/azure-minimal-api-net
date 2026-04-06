@@ -31,6 +31,7 @@ public static class DoctorEndpoints
 
         group.MapPost("/", CreateDoctorAsync)
             .AddEndpointFilter<ValidationFilter>()
+            .RequireAuthorization()
             .WithSummary("Create a new doctor")
             .WithDescription("Creates a new specialist doctor record.")
             .Produces(StatusCodes.Status201Created)
@@ -38,12 +39,14 @@ public static class DoctorEndpoints
 
         group.MapPut("/{id:guid}", UpdateDoctorAsync)
             .AddEndpointFilter<ValidationFilter>()
+            .RequireAuthorization()
             .WithSummary("Update an existing doctor")
             .WithDescription("Updates the details of an existing specialist doctor.")
             .ProducesProblem(StatusCodes.Status404NotFound)
             .ProducesProblem(StatusCodes.Status409Conflict);
 
         group.MapDelete("/{id:guid}", DeleteDoctorAsync)
+            .RequireAuthorization()
             .WithSummary("Delete a doctor")
             .WithDescription("Soft-deletes a specialist doctor by setting IsActive to false.")
             .Produces(StatusCodes.Status204NoContent)
