@@ -1,0 +1,29 @@
+# Pulumi Stack Configuration — Example
+# ======================================
+# Copy this file to Pulumi.dev.yaml and fill in your values:
+#   cp infra/Pulumi.dev.yaml.example infra/Pulumi.dev.yaml
+#
+# Then initialize the stack and set secrets:
+#   pulumi stack init dev
+#
+# Set non-secret config values:
+#   pulumi config set doctors-api-infra:env dev
+#   pulumi config set doctors-api-infra:sqlAdmin doctorsadmin
+#   pulumi config set doctors-api-infra:tenantId "<your-azure-tenant-id>"
+#   pulumi config set doctors-api-infra:location westus2
+#   pulumi config set doctors-api-infra:imageTag latest
+#
+# Set secret config values (you will be prompted to enter the value):
+#   pulumi config set --secret doctors-api-infra:sqlPassword "tu-password-aqui"
+#   pulumi config set --secret doctors-api-infra:jwtSigningKey "tu-jwt-key-aqui"
+
+config:
+  doctors-api-infra:env: dev
+  doctors-api-infra:sqlAdmin: doctorsadmin
+  doctors-api-infra:tenantId: "<your-azure-tenant-id>"
+  doctors-api-infra:location: westus2
+  doctors-api-infra:imageTag: latest
+  doctors-api-infra:sqlPassword:
+    secure: <set-with-pulumi-config-set--secret>
+  doctors-api-infra:jwtSigningKey:
+    secure: <set-with-pulumi-config-set--secret>

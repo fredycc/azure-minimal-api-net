@@ -179,6 +179,7 @@ azure-minimal-api-net/
 │   │
 │   └── Doctors.Api/                      # ← Depends on Application + Infrastructure
 │       ├── Program.cs                     # Composition root + JWT auth config
+│       ├── appsettings.Development.json.example  # ← Copy to appsettings.Development.json for local JWT config
 │       ├── Endpoints/
 │       │   ├── DoctorEndpoints.cs         # 5 CRUD route handlers (mutations require auth)
 │       │   └── AuthEndpoints.cs           # POST /auth/login → JWT token
@@ -199,12 +200,14 @@ azure-minimal-api-net/
 │
 ├── infra/                                # Pulumi Infrastructure as Code
 │   ├── Pulumi.yaml                        # Project definition
-│   ├── Pulumi.dev.yaml                    # Stack config (secrets encrypted)
+│   ├── Pulumi.dev.yaml                    # Stack config (secrets encrypted, gitignored)
+│   ├── Pulumi.dev.yaml.example            # ← Copy this to Pulumi.dev.yaml and fill in values
 │   ├── infra.csproj                       # Pulumi project
 │   └── Program.cs                         # Azure resource definitions (documented in Spanish)
 │
 ├── Dockerfile                             # Multi-stage: SDK 10.0 → ASP.NET 10.0
 ├── .dockerignore                          # Excludes bin/, obj/, infra/
+├── .env.example                           # ← Copy to .env for CI/CD (optional)
 ├── deploy.ps1                             # One-command deploy script (with pre-checks)
 ├── Directory.Build.props                  # Shared: net10.0, LangVersion 14
 └── azure-minimal-api-net.slnx             # Solution file (.NET 10 format)
@@ -214,8 +217,17 @@ azure-minimal-api-net/
 
 | File | Why | How to create |
 |------|-----|---------------|
-| `infra/Pulumi.dev.yaml` | Contains encrypted secrets (SQL password) | See [First-time Setup](#first-time-setup) |
+| `infra/Pulumi.dev.yaml` | Contains encrypted secrets (SQL password) | Copy from `infra/Pulumi.dev.yaml.example` → see [First-time Setup](#first-time-setup) |
+| `src/Doctors.Api/appsettings.Development.json` | Local JWT config (SigningKey) | Copy from `src/Doctors.Api/appsettings.Development.json.example` → see [First-time Setup](#first-time-setup) |
+| `.env` | Local environment variables | Copy from `.env.example` (optional — deploy.ps1 prompts interactively) |
 | `src/Doctors.Api/Properties/launchSettings.json` | Local dev settings | Auto-created by IDE, or see setup below |
+
+> **Tip**: The repo includes `.example` files for every gitignored config. After cloning:
+> ```bash
+> cp infra/Pulumi.dev.yaml.example infra/Pulumi.dev.yaml
+> cp src/Doctors.Api/appsettings.Development.json.example src/Doctors.Api/appsettings.Development.json
+> cp .env.example .env
+> ```
 
 ---
 
@@ -338,13 +350,13 @@ git checkout -b main
 
 The project includes a `.gitignore` configured to exclude:
 
-| File/Folder | Reason |
-|-------------|--------|
-| `bin/`, `obj/` | .NET build artifacts |
-| `.vs/` | Visual Studio config |
-| `infra/Pulumi.dev.yaml` | Contains encrypted secrets (SQL password) |
-| `appsettings.Development.json` | Local development config |
-| `.env` | Local environment variables |
+| File/Folder | Reason | `.example` included? |
+|-------------|--------|:-------------------:|
+| `bin/`, `obj/` | .NET build artifacts | — |
+| `.vs/` | Visual Studio config | — |
+| `infra/Pulumi.dev.yaml` | Contains encrypted secrets (SQL password) | ✅ `infra/Pulumi.dev.yaml.example` |
+| `appsettings.Development.json` | Local JWT config (signing key) | ✅ `src/Doctors.Api/appsettings.Development.json.example` |
+| `.env` | Local environment variables | ✅ `.env.example` |
 
 ### 3. First commit
 
@@ -404,6 +416,11 @@ git status  # These should NOT appear:
 # ✗ .env                        → environment variables
 # ✗ appsettings.Development.json → local config
 # ✗ launchSettings.json         → local URLs
+
+# These SHOULD appear (.example files are safe to commit):
+# ✓ infra/Pulumi.dev.yaml.example
+# ✓ src/Doctors.Api/appsettings.Development.json.example
+# ✓ .env.example
 ```
 
 **If you accidentally committed a secret:**
@@ -414,7 +431,7 @@ git rm --cached infra/Pulumi.dev.yaml
 git commit --amend --no-edit
 
 # If you already pushed — rotate the secret IMMEDIATELY
-pulumi config set sqlPassword "NEW_PASSWORD" --secret
+pulumi config set --secret doctors-api-infra:sqlPassword "NEW_PASSWORD"
 ```
 
 ### Daily workflow
@@ -452,7 +469,18 @@ cd azure-minimal-api-net
 dotnet restore
 ```
 
-**2. Create local dev settings**
+**2. Copy config from examples**
+
+```bash
+# Copy example files (REQUIRED — app won't start without these)
+cp infra/Pulumi.dev.yaml.example infra/Pulumi.dev.yaml
+cp src/Doctors.Api/appsettings.Development.json.example src/Doctors.Api/appsettings.Development.json
+
+# Optional: for CI/CD non-interactive deploy
+cp .env.example .env
+```
+
+**3. Create local dev settings**
 
 ```json
 // src/Doctors.Api/Properties/launchSettings.json
@@ -469,30 +497,30 @@ dotnet restore
 }
 ```
 
-**3. Initialize Pulumi (first time only)**
+**4. Initialize Pulumi (first time only)**
 
 ```bash
 cd infra
 pulumi login --local
 pulumi stack init dev
 
-# Set config (replace values)
-pulumi config set env dev
-pulumi config set sqlAdmin doctorsadmin
-pulumi config set tenantId "<your-azure-tenant-id>"
-pulumi config set location westus2
-pulumi config set imageTag latest
+# Set non-secret config values
+pulumi config set doctors-api-infra:env dev
+pulumi config set doctors-api-infra:sqlAdmin doctorsadmin
+pulumi config set doctors-api-infra:tenantId "<your-azure-tenant-id>"
+pulumi config set doctors-api-infra:location westus2
+pulumi config set doctors-api-infra:imageTag latest
 
-# Set SQL password as encrypted secret
-pulumi config set --secret sqlPassword
-# → Enter a strong password: uppercase + lowercase + number + symbol, 8+ chars
+# Set SQL password as encrypted secret (you'll be prompted to enter the value)
+pulumi config set --secret doctors-api-infra:sqlPassword "tu-password-aqui"
+# → Strong password: uppercase + lowercase + number + symbol, 8+ chars
 
 # Set JWT signing key as encrypted secret (≥ 32 characters)
-pulumi config set --secret jwtSigningKey
-# → Enter a strong random key, e.g.: openssl rand -base64 48
+pulumi config set --secret doctors-api-infra:jwtSigningKey "tu-jwt-key-aqui"
+# → Strong random key, e.g.: openssl rand -base64 48
 ```
 
-**4. Purge old Key Vault (if exists from previous deployment)**
+**5. Purge old Key Vault (if exists from previous deployment)**
 
 ```bash
 # Check if a soft-deleted Key Vault exists
@@ -770,12 +798,17 @@ curl http://localhost:5000/api/doctors
 
 ### JWT Settings (appsettings.Development.json)
 
+> **Note**: This file is gitignored. Copy from the example:
+> ```bash
+> cp src/Doctors.Api/appsettings.Development.json.example src/Doctors.Api/appsettings.Development.json
+> ```
+
 ```json
 {
   "JwtSettings": {
     "Issuer": "doctors-api",
     "Audience": "doctors-api",
-    "SigningKey": "doctors-api-dev-secret-key-min-32-chars-long!",
+    "SigningKey": "<replace-with-min-32-char-random-key>",
     "ExpiryMinutes": 60
   }
 }
@@ -801,6 +834,14 @@ curl http://localhost:5000/api/doctors
 > **Note:** Use double underscore (`__`) not colon (`:`) for nested config in environment variables.
 
 ### Pulumi Stack Config (infra/Pulumi.dev.yaml)
+
+> **Note**: This file is gitignored. Copy from the example:
+> ```bash
+> cp infra/Pulumi.dev.yaml.example infra/Pulumi.dev.yaml
+> # Then set secrets:
+> pulumi config set --secret doctors-api-infra:sqlPassword "tu-password-aqui"
+> pulumi config set --secret doctors-api-infra:jwtSigningKey "tu-jwt-key-aqui"
+> ```
 
 ```yaml
 config:

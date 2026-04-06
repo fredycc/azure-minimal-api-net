@@ -1,0 +1,8 @@
+{
+  "JwtSettings": {
+    "Issuer": "doctors-api",
+    "Audience": "doctors-api",
+    "SigningKey": "<replace-with-min-32-char-random-key>",
+    "ExpiryMinutes": 60
+  }
+}
