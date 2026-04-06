@@ -77,10 +77,10 @@
         - Key Vault with RBAC (no legacy AccessPolicies)
         - SQL connection string as Container App secret (not plaintext env var)
         - DiagnosticSettings for SQL and Key Vault audit logs
+        - ACR admin disabled (Managed Identity only)
         - Resource tags for cost tracking
 
     Known limitations (dev):
-        - ACR admin still enabled (TODO: disable after first deploy)
         - SQL firewall 0.0.0.0 (AllowAzureServices) kept for dev
         - No VNet integration (would cost $30-50/mes extra)
         - ASPNETCORE_ENVIRONMENT=Development (Swagger enabled)
@@ -258,11 +258,40 @@ if ($caExists) {
         Write-Error "Failed to update Container App image."
         exit 1
     }
+
+    # Verificar que tiene Managed Identity (si fue creado sin --system-assigned)
+    $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
+        --query "identity.principalId" -o tsv 2>$null
+
+    if (-not $caPrincipalId -or $caPrincipalId -eq "null") {
+        Write-Host "  Assigning SystemAssigned identity to existing Container App..." -ForegroundColor Yellow
+        az containerapp identity assign --name $CaName --resource-group $RgName --system-assigned | Out-Null
+        $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
+            --query "identity.principalId" -o tsv 2>$null
+    }
+
+    # Verificar que tiene rol AcrPull
+    $acrId = az acr show --name $AcrName --query "id" -o tsv 2>$null
+    $acrPullRoleId = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    $existingRole = az role assignment list --assignee $caPrincipalId --role $acrPullRoleId --scope $acrId --query "[0].id" -o tsv 2>$null
+
+    if (-not $existingRole) {
+        Write-Host "  Assigning AcrPull role to existing Container App..." -ForegroundColor Yellow
+        az role assignment create `
+            --assignee-object-id $caPrincipalId `
+            --assignee-principal-type ServicePrincipal `
+            --role $acrPullRoleId `
+            --scope $acrId | Out-Null
+        Write-Host "  AcrPull role assigned" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  AcrPull role already assigned" -ForegroundColor Green
+    }
 }
 else {
     Write-Host "  Creating Container App with Managed Identity..." -ForegroundColor Yellow
     
-    # Crear el Container App con Managed Identity y credenciales del ACR
+    # Crear el Container App con SystemAssigned Managed Identity
     az containerapp create `
         --name $CaName `
         --resource-group $RgName `
@@ -275,6 +304,8 @@ else {
         --cpu 0.25 `
         --memory "0.5Gi" `
         --registry-server "$AcrName.azurecr.io" `
+        --registry-identity system `
+        --system-assigned `
         --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" `
         --secrets "sql-connection-string=$sqlConnSecret" `
         --query "properties.provisioningState" -o tsv
@@ -282,6 +313,35 @@ else {
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to create Container App."
         exit 1
+    }
+
+    # Asignar rol AcrPull al Managed Identity del Container App
+    # Sin esto, el Container App no puede hacer pull de imágenes del ACR
+    # (necesario cuando AdminUserEnabled = false)
+    Write-Host "  Assigning AcrPull role to Container App..." -ForegroundColor Yellow
+
+    $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
+        --query "identity.principalId" -o tsv 2>$null
+
+    if ($caPrincipalId) {
+        $acrId = az acr show --name $AcrName --query "id" -o tsv 2>$null
+        $acrPullRoleId = "7f951dda-4ed3-4680-a7ca-43fe172d538d" # AcrPull (built-in)
+
+        az role assignment create `
+            --assignee-object-id $caPrincipalId `
+            --assignee-principal-type ServicePrincipal `
+            --role $acrPullRoleId `
+            --scope $acrId | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "AcrPull role assignment failed. Container App may not be able to pull images."
+        }
+        else {
+            Write-Host "  AcrPull role assigned" -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Warning "Could not get Container App principal ID. AcrPull role not assigned."
     }
 }
 

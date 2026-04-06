@@ -111,8 +111,8 @@ return await Pulumi.Deployment.RunAsync(() =>
     //
     // Tier Basic: ~$5/mes (suficiente para dev, sin vulnerability scanning).
     //
-    // AdminUserEnabled: true (temporal — permite pull con username/password).
-    // TODO: Cambiar a false después del primer deploy exitoso y confiar en AcrPull role.
+    // AdminUserEnabled: false → autenticación vía Managed Identity + rol AcrPull.
+    // NUNCA usar admin credentials en un registry conectado a internet.
     //
     // Convención de nombres: sin guiones (acrdoctorsapidev, no acr-doctors-api-dev)
     //
@@ -125,7 +125,7 @@ return await Pulumi.Deployment.RunAsync(() =>
         {
             Name = AzureNative.ContainerRegistry.SkuName.Basic,
         },
-        AdminUserEnabled = true,
+        AdminUserEnabled = false,
         Tags = tags,
     });
 
