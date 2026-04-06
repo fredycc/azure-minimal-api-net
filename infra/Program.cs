@@ -225,11 +225,31 @@ return await Pulumi.Deployment.RunAsync(() =>
     // Esto permite que el Managed Identity del Container App lea secrets
     // sin necesidad de AccessPolicies manuales.
     //
+    // PROBLEMA: Key Vault tiene soft-delete habilitado por defecto (no se puede
+    // desactivar). Al hacer `pulumi destroy && pulumi up`, el vault anterior
+    // sigue como "soft-deleted" y el recreate falla con 409 Conflict.
+    //
+    // SOLUCIÓN: Un LocalCommand que purga el vault soft-deleted ANTES de crearlo.
+    //   - Primero busca si existe en soft-deleted state
+    //   - Si existe → lo purga (eliminación permanente)
+    //   - Si no existe → continúa sin error (idempotente)
+    //
+    // enablePurgeProtection = false → permite purge automático.
+    // En producción, habilitar purge protection para evitar borrado accidental.
+    //
     // SKU Standard: ~$3/mes, suficiente para dev.
     //
+    var vaultName = $"kv-doctors-api-{env}";
+    var purgeVault = new Pulumi.Command.Local.Command($"purge-kv-{env}", new()
+    {
+        Create = Output.Format($"az keyvault show-deleted --name {vaultName} --query name -o tsv 2>$null && az keyvault purge --name {vaultName} --no-wait || echo 'No soft-deleted vault found, skipping purge'"),
+        // Trigger re-run on every `pulumi up` — the command is idempotent
+        Triggers = new[] { DateTime.UtcNow.ToString("yyyy-MM-dd") },
+    });
+
     var keyVault = new AzureNative.KeyVault.Vault($"kv-doctors-api-{env}", new()
     {
-        VaultName = $"kv-doctors-api-{env}",
+        VaultName = vaultName,
         ResourceGroupName = resourceGroup.Name,
         Location = resourceGroup.Location,
         Properties = new AzureNative.KeyVault.Inputs.VaultPropertiesArgs
@@ -241,9 +261,11 @@ return await Pulumi.Deployment.RunAsync(() =>
                 Name = AzureNative.KeyVault.SkuName.Standard,
             },
             EnableRbacAuthorization = true,
+            EnableSoftDelete = true,
+            EnablePurgeProtection = false,
         },
         Tags = tags,
-    });
+    }, new CustomResourceOptions { DependsOn = purgeVault });
 
     // =========================================================================
     // 9. SQL CONNECTION STRING → KEY VAULT SECRET (nombre dinámico)
@@ -252,14 +274,9 @@ return await Pulumi.Deployment.RunAsync(() =>
     // La connection string se construye con Outputs de Pulumi (sqlServer.Name, etc).
     // Se guarda como secret en Key Vault para centralizar gestión de credenciales.
     //
-    // NOMBRE DINÁMICO: Los secrets de Key Vault tienen soft-delete de 90 días.
-    // Al destruir y recrear la infra, el nombre anterior sigue reservado.
-    // Usamos un timestamp para generar un nombre único en cada creación.
-    // Esto evita el error 409 Conflict sin necesidad de purge manual.
-    //
-    // El Pulumi resource name (sql-conn-dev) se mantiene fijo para el state.
-    // El Azure secret name incluye la location para ser estable entre deploys
-    // pero único entre stacks/regiones (evita soft-delete conflict en recreate).
+    // El vault purge (sección 8) ya maneja el soft-delete del vault completo.
+    // El sufijo de location en el secret name se mantiene como safety net
+    // por si el vault no fue purgado (ej: deploy manual sin pulumi destroy previo).
     //
     // Encrypt=True + Trust Server Certificate=False = obligatorio para Azure SQL.
     //
