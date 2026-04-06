@@ -11,9 +11,9 @@
         .NET 10 Minimal API → Docker → ACR → Container App → Azure SQL Serverless
 
     Flow:
-        1. pulumi up → creates base infra (RG, ACR, SQL, KV, CAE, etc.)
+        1. pulumi up → creates ALL infra (RG, ACR, SQL, KV, CAE, Container App, etc.)
         2. docker build + push → pushes image to ACR
-        3. az containerapp create → creates the Container App with the image
+        3. az containerapp update → updates image on existing Container App
         4. Verify API health
 
 .PARAMETER Tag
@@ -52,22 +52,25 @@
 
     Azure Resources created by Pulumi:
         rg-doctors-api-dev          Resource Group (westus2)
-        ├── acrdoctorsapidev        Container Registry (Basic, admin enabled)
+        ├── acrdoctorsapidev        Container Registry (Basic, no admin)
         ├── law-doctors-api-dev     Log Analytics Workspace (PerGB2018)
         ├── sql-doctors-api-dev     SQL Server
         │   ├── sqldb-doctors-dev   SQL Database (Serverless, auto-pause 60min)
-        │   └── fw-allow-azure      Firewall: AllowAzureServices (0.0.0.0)
+        │   ├── fw-allow-azure      Firewall: AllowAzureServices (0.0.0.0)
+        │   └── AllowContainerApp   Firewall: Container App outbound IP
         ├── kv-doctors-api-dev      Key Vault (RBAC mode)
-        │   └── sql-connection-string (secret)
+        │   ├── sql-conn-dev        Connection string secret
+        │   └── jwt-signing-key-dev JWT signing key secret
         ├── cae-doctors-api-dev     Container App Environment
+        ├── ca-doctors-api-dev      Container App (placeholder image, MinReplicas=0)
+        │   ├── SystemAssigned Managed Identity
+        │   ├── AcrPull role → ACR
+        │   └── KeyVaultSecretsUser role → KV
         ├── diag-sql-dev            DiagnosticSettings → Log Analytics
         └── diag-kv-dev             DiagnosticSettings → Log Analytics
 
-    Azure Resources created by deploy.ps1:
-        └── ca-doctors-api-dev      Container App (your API)
-            ├── SystemAssigned Managed Identity
-            ├── AcrPull role → ACR
-            └── KeyVaultSecretsUser role → KV
+    Azure Resources updated by deploy.ps1:
+        └── ca-doctors-api-dev      Container App (image update only)
 
     Estimated cost: ~$10/mes idle, ~$15-20/mes with traffic
 
@@ -146,12 +149,12 @@ if (-not $env:PULUMI_CONFIG_PASSPHRASE -and -not $env:PULUMI_CONFIG_PASSPHRASE_F
 # ──────────────────────────────────────────────────────────────
 # PASO 1: INFRAESTRUCTURA BASE (Pulumi)
 # ──────────────────────────────────────────────────────────────
-# Crea: Resource Group, ACR, SQL Server/DB, Key Vault, Log Analytics,
-#       Container App Environment, Diagnostic Settings, KV Secret,
-#       y rol Key Vault Secrets Officer para el usuario de Pulumi.
+# Crea TODA la infra: Resource Group, ACR, SQL Server/DB, Key Vault,
+# Log Analytics, Container App Environment, Container App (placeholder),
+# Diagnostic Settings, KV Secrets, y roles RBAC.
 #
-# NO crea el Container App — ese se crea en el Paso 5 via Azure CLI
-# porque necesita la imagen Docker que aún no existe.
+# El Container App se crea con una imagen placeholder pública y
+# MinReplicas=0 para evitar errores en el primer deploy.
 
 Write-Host "`n=== Step 1: Provision infrastructure ===" -ForegroundColor Cyan
 
@@ -175,6 +178,9 @@ Write-Host "  Infrastructure provisioned" -ForegroundColor Green
 # ──────────────────────────────────────────────────────────────
 # Autentica Docker contra Azure Container Registry para poder hacer push.
 
+Write-Host "`n=== Step 2: Login to ACR ===" -ForegroundColor Cyan
+az acr login --name $AcrName
+
 # ──────────────────────────────────────────────────────────────
 # PASO 3: BUILD DOCKER
 # ──────────────────────────────────────────────────────────────
@@ -182,224 +188,68 @@ Write-Host "  Infrastructure provisioned" -ForegroundColor Green
 #   - Build stage: dotnet restore + publish en SDK 10.0
 #   - Runtime stage: aspnet 10.0 (más liviana, ~200MB)
 
+Write-Host "`n=== Step 3: Build Docker image ===" -ForegroundColor Cyan
+docker build -t $ImageName . 2>&1 | Out-Null
+Write-Host "  Image built: $ImageName" -ForegroundColor Green
+
 # ──────────────────────────────────────────────────────────────
 # PASO 4: PUSH A ACR
 # ──────────────────────────────────────────────────────────────
 # Sube la imagen a Azure Container Registry.
 
-# ──────────────────────────────────────────────────────────────
-# PASO 5: CREAR CONTAINER APP (Azure CLI)
-# ──────────────────────────────────────────────────────────────
-# El Container App se crea con Azure CLI (no con Pulumi) porque:
-#   1. La imagen ya existe en el ACR (build+push completado)
-#   2. Evita condiciones de carrera con el rol AcrPull
-#   3. No requiere workarounds de MinReplicas=0 en Pulumi
-#
-# Se obtiene el connection string del Key Vault y se pasa como secret.
-# Si el Container App ya existe, solo se actualiza la imagen.
+Write-Host "`n=== Step 4: Push to ACR ===" -ForegroundColor Cyan
+docker push $ImageName --quiet 2>&1 | Out-Null
+Write-Host "  Image pushed to ACR" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────────
-# PASO 6: FIREWALL SQL PARA CONTAINER APP
+# PASO 5: CONFIGURAR REGISTRY Y ACTUALIZAR IMAGEN DEL CONTAINER APP
 # ──────────────────────────────────────────────────────────────
-# El alias "AllowAzureServices" (0.0.0.0) NO cubre Container Apps.
-# Se crea una regla con la IP outbound real del Container App.
+# El Container App ya fue creado por Pulumi con una imagen placeholder.
+# Primero configuramos el ACR con la identidad del sistema (necesario para pull).
+# Luego actualizamos la imagen.
+
+Write-Host "`n=== Step 5: Configure registry and update Container App image ===" -ForegroundColor Cyan
+
+# Configurar el registry con identidad del sistema
+Write-Host "  Configuring ACR registry with system identity..." -ForegroundColor Yellow
+az containerapp registry set `
+    --name $CaName `
+    --resource-group $RgName `
+    --server "$AcrName.azurecr.io" `
+    --identity system 2>&1 | Out-Null
+
+# Actualizar la imagen
+Write-Host "  Updating Container App image..." -ForegroundColor Yellow
+$updateResult = az containerapp update `
+    --name $CaName `
+    --resource-group $RgName `
+    --image $ImageName 2>&1
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  First update attempt failed, retrying..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
+    az containerapp update --name $CaName --resource-group $RgName --image $ImageName 2>&1 | Out-Null
+}
+
+# Obtener la URL del Container App
+$caFqdn = az containerapp show --name $CaName --resource-group $RgName --query "properties.configuration.ingress.fqdn" -o tsv 2>$null
+
+if ($LASTEXITCODE -ne 0 -or -not $caFqdn) {
+    Write-Error "Failed to update Container App image."
+    exit 1
+}
+
+Write-Host "  Container App ready: https://$caFqdn" -ForegroundColor Green
+
+Write-Host "  Container App image updated: $ImageName" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────────
-# PASO 7: VERIFICAR DEPLOY
+# PASO 6: VERIFICAR DEPLOY
 # ──────────────────────────────────────────────────────────────
 # Espera a que la API responda (máx 120s — SQL serverless puede
 # tardar al despertar). Muestra las URLs finales.
 
-Write-Host "`n=== Step 2: Login to ACR ===" -ForegroundColor Cyan
-az acr login --name $AcrName
-
-# ──────────────────────────────────────────────────────────────
-# STEP 3: BUILD DOCKER
-# ──────────────────────────────────────────────────────────────
-
-Write-Host "`n=== Step 3: Build Docker image ===" -ForegroundColor Cyan
-docker build -t $ImageName .
-
-# ──────────────────────────────────────────────────────────────
-# STEP 4: PUSH A ACR
-# ──────────────────────────────────────────────────────────────
-
-Write-Host "`n=== Step 4: Push to ACR ===" -ForegroundColor Cyan
-docker push $ImageName
-
-# ──────────────────────────────────────────────────────────────
-# STEP 5: CREAR CONTAINER APP (Azure CLI)
-# ──────────────────────────────────────────────────────────────
-# El Container App se crea con Azure CLI porque:
-#   1. La imagen ya existe en el ACR (build+push completado)
-#   2. Evita condiciones de carrera con el rol AcrPull
-#   3. No requiere workarounds de MinReplicas=0 en Pulumi
-#
-# Se usa Managed Identity (SystemAssigned) con roles AcrPull y
-# KeyVaultSecretsUser para autenticación sin credenciales.
-
-Write-Host "`n=== Step 5: Create Container App ===" -ForegroundColor Cyan
-
-# Obtener secrets del Key Vault
-$sqlConnSecret = az keyvault secret show --vault-name $KvName --name "sql-conn-dev-westus2" --query "value" -o tsv 2>$null
-$jwtSigningKey = az keyvault secret show --vault-name $KvName --name "jwt-signing-key-dev" --query "value" -o tsv 2>$null
-
-if (-not $sqlConnSecret) {
-    Write-Error "No se pudo obtener el connection string del Key Vault."
-    exit 1
-}
-
-if (-not $jwtSigningKey) {
-    Write-Error "No se pudo obtener el JWT signing key del Key Vault."
-    exit 1
-}
-
-# Verificar si el Container App ya existe
-$caExists = az containerapp show --name $CaName --resource-group $RgName --query "name" -o tsv 2>$null
-
-if ($caExists) {
-    Write-Host "  Container App already exists. Updating image..." -ForegroundColor Yellow
-    az containerapp update --name $CaName --resource-group $RgName --image $ImageName
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to update Container App image."
-        exit 1
-    }
-
-    # Verificar que tiene Managed Identity (si fue creado sin --system-assigned)
-    $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
-        --query "identity.principalId" -o tsv 2>$null
-
-    if (-not $caPrincipalId -or $caPrincipalId -eq "null") {
-        Write-Host "  Assigning SystemAssigned identity to existing Container App..." -ForegroundColor Yellow
-        az containerapp identity assign --name $CaName --resource-group $RgName --system-assigned | Out-Null
-        $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
-            --query "identity.principalId" -o tsv 2>$null
-    }
-
-    # Verificar que tiene rol AcrPull
-    $acrId = az acr show --name $AcrName --query "id" -o tsv 2>$null
-    $acrPullRoleId = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
-    $existingRole = az role assignment list --assignee $caPrincipalId --role $acrPullRoleId --scope $acrId --query "[0].id" -o tsv 2>$null
-
-    if (-not $existingRole) {
-        Write-Host "  Assigning AcrPull role to existing Container App..." -ForegroundColor Yellow
-        az role assignment create `
-            --assignee-object-id $caPrincipalId `
-            --assignee-principal-type ServicePrincipal `
-            --role $acrPullRoleId `
-            --scope $acrId | Out-Null
-        Write-Host "  AcrPull role assigned" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  AcrPull role already assigned" -ForegroundColor Green
-    }
-}
-else {
-    Write-Host "  Creating Container App with Managed Identity..." -ForegroundColor Yellow
-    
-    # Crear el Container App con SystemAssigned Managed Identity
-    az containerapp create `
-        --name $CaName `
-        --resource-group $RgName `
-        --environment $CaeName `
-        --image $ImageName `
-        --target-port 8080 `
-        --ingress external `
-        --min-replicas 1 `
-        --max-replicas 5 `
-        --cpu 0.25 `
-        --memory "0.5Gi" `
-        --registry-server "$AcrName.azurecr.io" `
-        --registry-identity system `
-        --system-assigned `
-        --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" "JwtSettings__SigningKey=secretref:jwt-signing-key" `
-        --secrets "sql-connection-string=$sqlConnSecret" "jwt-signing-key=$jwtSigningKey" `
-        --query "properties.provisioningState" -o tsv
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to create Container App."
-        exit 1
-    }
-
-    # Asignar rol AcrPull al Managed Identity del Container App
-    # Sin esto, el Container App no puede hacer pull de imágenes del ACR
-    # (necesario cuando AdminUserEnabled = false)
-    Write-Host "  Assigning AcrPull role to Container App..." -ForegroundColor Yellow
-
-    $caPrincipalId = az containerapp show --name $CaName --resource-group $RgName `
-        --query "identity.principalId" -o tsv 2>$null
-
-    if ($caPrincipalId) {
-        $acrId = az acr show --name $AcrName --query "id" -o tsv 2>$null
-        $acrPullRoleId = "7f951dda-4ed3-4680-a7ca-43fe172d538d" # AcrPull (built-in)
-
-        az role assignment create `
-            --assignee-object-id $caPrincipalId `
-            --assignee-principal-type ServicePrincipal `
-            --role $acrPullRoleId `
-            --scope $acrId | Out-Null
-
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "AcrPull role assignment failed. Container App may not be able to pull images."
-        }
-        else {
-            Write-Host "  AcrPull role assigned" -ForegroundColor Green
-        }
-    }
-    else {
-        Write-Warning "Could not get Container App principal ID. AcrPull role not assigned."
-    }
-}
-
-Write-Host "  Container App ready with image: $ImageName" -ForegroundColor Green
-
-# ──────────────────────────────────────────────────────────────
-# STEP 6: CONFIGURAR FIREWALL RULE PARA SQL
-# ──────────────────────────────────────────────────────────────
-# El Container App necesita acceso al SQL Server.
-# Creamos una firewall rule con la IP outbound del Container App.
-
-Write-Host "`n=== Step 6: Configure SQL firewall ===" -ForegroundColor Cyan
-
-$caOutboundIp = az containerapp show --name $CaName --resource-group $RgName --query "properties.outboundIpAddresses[0]" -o tsv 2>$null
-
-if ($caOutboundIp) {
-    # Verificar si la regla ya existe
-    $fwExists = az sql server firewall-rule show `
-        --server "sql-doctors-api-$Env" `
-        --resource-group $RgName `
-        --name "AllowContainerApp" `
-        --query "name" -o tsv 2>$null
-
-    if ($fwExists) {
-        Write-Host "  Updating firewall rule for IP: $caOutboundIp" -ForegroundColor Yellow
-        az sql server firewall-rule update `
-            --server "sql-doctors-api-$Env" `
-            --resource-group $RgName `
-            --name "AllowContainerApp" `
-            --start-ip-address $caOutboundIp `
-            --end-ip-address $caOutboundIp | Out-Null
-    }
-    else {
-        Write-Host "  Creating firewall rule for IP: $caOutboundIp" -ForegroundColor Yellow
-        az sql server firewall-rule create `
-            --server "sql-doctors-api-$Env" `
-            --resource-group $RgName `
-            --name "AllowContainerApp" `
-            --start-ip-address $caOutboundIp `
-            --end-ip-address $caOutboundIp | Out-Null
-    }
-    Write-Host "  Firewall rule configured" -ForegroundColor Green
-}
-else {
-    Write-Warning "Could not get Container App outbound IP. SQL access may be blocked."
-}
-
-# ──────────────────────────────────────────────────────────────
-# STEP 7: VERIFICAR DEPLOY
-# ──────────────────────────────────────────────────────────────
-
-Write-Host "`n=== Step 7: Verify deployment ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 6: Verify deployment ===" -ForegroundColor Cyan
 
 $url = az containerapp show --name $CaName --resource-group $RgName --query "properties.configuration.ingress.fqdn" -o tsv 2>$null
 

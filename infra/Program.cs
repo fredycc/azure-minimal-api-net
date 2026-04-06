@@ -17,9 +17,11 @@
 // ║  7. Key Vault             ← Almacena secrets (RBAC, no AccessPolicies)  ║
 // ║  8. KV Secret             ← Connection string (nombre dinámico)         ║
 // ║  9. Container App         ← Tu API .NET corriendo en containers         ║
-// ║ 10. Firewall Rule (CA)    ← Permite al Container App hablar con SQL     ║
-// ║ 11. RBAC Role Assignments ← AcrPull + KeyVaultSecretsUser              ║
-// ║ 12. Diagnostic Settings   ← Logs de SQL y KV → Log Analytics            ║
+// ║ 10. RBAC AcrPull          ← Container App → ACR (sin admin creds)      ║
+// ║ 11. RBAC KV Secrets User  ← Container App → Key Vault                  ║
+// ║ 12. KV Admin Role         ← Usuario Pulumi → Key Vault                  ║
+// ║ 13. Firewall Rule (CA)    ← Permite al Container App hablar con SQL     ║
+// ║ 14. Diagnostic Settings   ← Logs de SQL y KV → Log Analytics            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 //
 // COSTO ESTIMADO (ambiente dev):
@@ -56,6 +58,8 @@ return await Pulumi.Deployment.RunAsync(() =>
     var sqlPassword = config.RequireSecret("sqlPassword"); // Password del SQL (encriptado en state)
     var tenantId = config.Require("tenantId");           // Azure AD Tenant ID
     var location = config.Get("location") ?? "eastus";  // Región Azure (default: eastus)
+    var costMode = config.Get("costMode") ?? "nano";    // Modo de costo: nano, mini, normal, full
+    
     var clientConfig = AzureNative.Authorization.GetClientConfig.Invoke();
     var subscriptionId = clientConfig.Apply(c => c.SubscriptionId); // Para RBAC role definitions
 
@@ -67,10 +71,53 @@ return await Pulumi.Deployment.RunAsync(() =>
     //
     var tags = new Dictionary<string, string>
     {
-        { "environment", "dev" },                        // Ambiente (dev/staging/prod)
-        { "project", "azure-minimal-api-net" },          // Nombre del proyecto
-        { "managed-by", "pulumi" }                       // Quién gestiona el recurso
+        { "environment", env },
+        { "project", "azure-minimal-api-net" },
+        { "managed-by", "pulumi-user" }
     };
+
+    // =========================================================================
+    // COST CONFIG — Configuración de costos basada en costMode
+    // =========================================================================
+    //
+    // Modos disponibles:
+    //   nano:   Costos ultra-bajos. Para testing máximo. ~$3-5/mes
+    //   mini:   Costos mínimos para dev activo. ~$5-8/mes
+    //   normal: Configuración balanced. ~$10-15/mes
+    //   full:   Máxima capacidad para producción. ~$25-40/mes
+    //
+    // Para cambiar el modo: pulumi config set costMode nano --cwd infra
+    //
+    string sqlTier;
+    long sqlMaxSize;
+    int caMinReplicas;
+    int caMaxReplicas;
+    double caCpu;
+    string caMemory;
+    bool enableDiagnostics;
+
+    (caMinReplicas, caMaxReplicas, caCpu, caMemory, enableDiagnostics, sqlTier, sqlMaxSize) = costMode switch
+    {
+        "nano"   => (0, 1, 0.25, "0.5Gi", false, "GP_S_Gen5_1", 1073741824L),      // Min válido: 0.25 CPU / 0.5Gi
+        "mini"   => (0, 2, 0.25, "0.5Gi", false, "GP_S_Gen5_1", 2147483648L),     // Mismo que nano con más DB
+        "normal" => (1, 5, 0.25, "0.5Gi", true, "GP_S_Gen5_2", 2147483648L),
+        "full"   => (2, 10, 0.5, "1Gi", true, "GP_S_Gen5_2", 5368709120L),
+        _        => (0, 1, 0.25, "0.5Gi", false, "GP_S_Gen5_1", 1073741824L),     // Default: nano
+    };
+
+    // Mostrar configuración de costo en consola
+    Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+    Console.WriteLine($"  COST MODE: {costMode.ToUpper()}");
+    Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+    Console.WriteLine($"  Container App  → MinReplicas: {caMinReplicas}, MaxReplicas: {caMaxReplicas}, CPU: {caCpu}, Memory: {caMemory}");
+    Console.WriteLine($"  SQL Database   → SKU: {sqlTier}, MaxSize: {sqlMaxSize / 1073741824}GB");
+    Console.WriteLine($"  Diagnostics    → {(enableDiagnostics ? "✅ Enabled" : "❌ Disabled")}");
+    Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+    Console.WriteLine();
+
+    // SQL Serverless config (siempre optimizado para costos)
+    var sqlAutoPauseDelay = 60;  // Minutos antes de pausar
+    var sqlMinCapacity = 0.5;    // vCores mínimos cuando activo
 
     // =========================================================================
     // 1. RESOURCE GROUP — Contenedor lógico de todos los recursos
@@ -190,12 +237,12 @@ return await Pulumi.Deployment.RunAsync(() =>
         Location = resourceGroup.Location,
         Sku = new AzureNative.Sql.Inputs.SkuArgs
         {
-            Name = "GP_S_Gen5_2",
+            Name = sqlTier,
             Tier = "GeneralPurpose",
         },
-        AutoPauseDelay = 60,
-        MinCapacity = 0.5,
-        MaxSizeBytes = 2147483648,
+        AutoPauseDelay = sqlAutoPauseDelay,
+        MinCapacity = sqlMinCapacity,
+        MaxSizeBytes = sqlMaxSize,
         Tags = tags,
     });
 
@@ -234,18 +281,12 @@ return await Pulumi.Deployment.RunAsync(() =>
     //   - Si existe → lo purga (eliminación permanente)
     //   - Si no existe → continúa sin error (idempotente)
     //
-    // enablePurgeProtection = false → permite purge automático.
-    // En producción, habilitar purge protection para evitar borrado accidental.
-    //
     // SKU Standard: ~$3/mes, suficiente para dev.
     //
+    // NOTA: El purge del Key Vault soft-deleted se maneja en destroy-all.ps1
+    // para evitar errores 409 al recrear el vault.
+    //
     var vaultName = $"kv-doctors-api-{env}";
-    var purgeVault = new Pulumi.Command.Local.Command($"purge-kv-{env}", new()
-    {
-        Create = Output.Format($"az keyvault show-deleted --name {vaultName} --query name -o tsv 2>$null && az keyvault purge --name {vaultName} --no-wait || echo 'No soft-deleted vault found, skipping purge'"),
-        // Trigger re-run on every `pulumi up` — the command is idempotent
-        Triggers = new[] { DateTime.UtcNow.ToString("yyyy-MM-dd") },
-    });
 
     var keyVault = new AzureNative.KeyVault.Vault($"kv-doctors-api-{env}", new()
     {
@@ -262,10 +303,9 @@ return await Pulumi.Deployment.RunAsync(() =>
             },
             EnableRbacAuthorization = true,
             EnableSoftDelete = true,
-            EnablePurgeProtection = false,
         },
         Tags = tags,
-    }, new CustomResourceOptions { DependsOn = purgeVault });
+    });
 
     // =========================================================================
     // 9. SQL CONNECTION STRING → KEY VAULT SECRET (nombre dinámico)
@@ -312,22 +352,113 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
-    // 10. CONTAINER APP — Se crea via deploy.ps1 (az containerapp create)
+    // 9. CONTAINER APP — Tu API .NET corriendo en containers
     // =========================================================================
     //
-    // El Container App NO se crea aquí porque necesita una imagen Docker
-    // que aún no existe cuando se corre pulumi up por primera vez.
+    // PROBLEMA ORIGINAL: La ContainerApp se creaba via deploy.ps1 porque en el
+    // primer pulumi up la imagen Docker aún no existe en el ACR.
     //
-    // deploy.ps1 se encarga de:
-    //   1. Crear infra base con pulumi up
-    //   2. Build + Push de la imagen al ACR
-    //   3. Crear el Container App con az containerapp create
+    // SOLUCIÓN: Se crea con una imagen placeholder pública (siempre disponible)
+    // y MinReplicas=0. deploy.ps1 luego actualiza la imagen tras el build+push.
     //
-    // Esto evita:
-    //   - Errores de "imagen no encontrada" cuando el ACR está vacío
-    //   - Condiciones de carrera con el rol AcrPull
-    //   - Workarounds de MinReplicas=0
+    // Los secrets (connection string, JWT key) se almacenan directamente en la
+    // Container App como secretos planos (sus valores se leen del Key Vault).
+    // IgnoreChanges en la imagen → Pulumi no revierte los updates de deploy.ps1.
     //
+    var containerApp = new AzureNative.App.ContainerApp($"ca-doctors-api-{env}", new()
+    {
+        ContainerAppName = $"ca-doctors-api-{env}",
+        ResourceGroupName = resourceGroup.Name,
+        Location = resourceGroup.Location,
+        EnvironmentId = containerAppEnvironment.Id,
+        Identity = new AzureNative.App.Inputs.ManagedServiceIdentityArgs
+        {
+            Type = AzureNative.App.ManagedServiceIdentityType.SystemAssigned,
+        },
+        Configuration = new AzureNative.App.Inputs.ConfigurationArgs
+        {
+            Secrets = new[]
+            {
+                new AzureNative.App.Inputs.SecretArgs
+                {
+                    Name = "sql-connection-string",
+                    Value = sqlConnectionString,
+                },
+                new AzureNative.App.Inputs.SecretArgs
+                {
+                    Name = "jwt-signing-key",
+                    Value = config.RequireSecret("jwtSigningKey"),
+                },
+            },
+            Ingress = new AzureNative.App.Inputs.IngressArgs
+            {
+                External = true,
+                TargetPort = 8080,
+                Transport = "auto",
+            },
+        },
+        Template = new AzureNative.App.Inputs.TemplateArgs
+        {
+            Containers = new[]
+            {
+                new AzureNative.App.Inputs.ContainerArgs
+                {
+                    Name = "doctors-api",
+                    Image = "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest",
+                    Env = new[]
+                    {
+                        new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "ASPNETCORE_ENVIRONMENT", Value = "Development" },
+                        new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "ConnectionStrings__DefaultConnection", SecretRef = "sql-connection-string" },
+                        new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "JwtSettings__SigningKey", SecretRef = "jwt-signing-key" },
+                    },
+                    Resources = new AzureNative.App.Inputs.ContainerResourcesArgs
+                    {
+                        Cpu = caCpu,
+                        Memory = caMemory,
+                    },
+                },
+            },
+            Scale = new AzureNative.App.Inputs.ScaleArgs
+            {
+                MinReplicas = caMinReplicas,
+                MaxReplicas = caMaxReplicas,
+            },
+        },
+    }, new CustomResourceOptions
+    {
+        IgnoreChanges = { "template.containers[0].image" },
+        DependsOn = { sqlConnectionStringSecret, jwtSigningKeySecret },
+    });
+
+    // =========================================================================
+    // 10. RBAC: AcrPull para Container App → ACR
+    // =========================================================================
+    //
+    // Sin este rol, el Container App no puede hacer pull de imágenes del ACR
+    // (necesario porque AdminUserEnabled = false).
+    //
+    var acrPullRole = new AzureNative.Authorization.RoleAssignment($"acr-pull-{env}", new()
+    {
+        PrincipalId = containerApp.Identity.Apply(i => i!.PrincipalId),
+        PrincipalType = "ServicePrincipal",
+        RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+        Scope = containerRegistry.Id,
+    });
+
+    // =========================================================================
+    // 10b. RBAC: KeyVaultSecretsUser para Container App → Key Vault
+    // =========================================================================
+    //
+    // Permite que el Container App lea secrets del Key Vault usando su
+    // Managed Identity (sin AccessPolicies legacy).
+    //
+    var kvSecretsUser = new AzureNative.Authorization.RoleAssignment($"kv-user-{env}", new()
+    {
+        PrincipalId = containerApp.Identity.Apply(i => i!.PrincipalId),
+        PrincipalType = "ServicePrincipal",
+        RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6"),
+        Scope = keyVault.Id,
+    });
 
     // =========================================================================
     // 11. RBAC: Key Vault Secrets Officer para el usuario que corre Pulumi
@@ -346,7 +477,22 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
-    // 12. DIAGNOSTIC SETTINGS — Logs → Log Analytics
+    // 12. FIREWALL RULE: AllowContainerApp — IP outbound del Container App
+    // =========================================================================
+    //
+    // El alias "AllowAzureServices" (0.0.0.0) NO cubre Container Apps.
+    // Se crea una regla con la IP outbound real del Container App.
+    // Se gestiona via Command porque la IP solo está disponible tras la creación.
+    //
+    var containerAppFirewallRule = new Pulumi.Command.Local.Command($"fw-ca-ip-{env}", new()
+    {
+        Create = Output.Format($"powershell -Command \"$ip = (az containerapp show --name ca-doctors-api-{env} --resource-group {resourceGroup.Name} --query 'properties.outboundIpAddresses[0]' -o tsv); if ($ip) {{ az sql server firewall-rule create --server {sqlServer.Name} --resource-group {resourceGroup.Name} --name AllowContainerApp --start-ip-address $ip --end-ip-address $ip }} else {{ Write-Host 'No IP found' }}\""),
+        Update = Output.Format($"powershell -Command \"$ip = (az containerapp show --name ca-doctors-api-{env} --resource-group {resourceGroup.Name} --query 'properties.outboundIpAddresses[0]' -o tsv); if ($ip) {{ az sql server firewall-rule update --server {sqlServer.Name} --resource-group {resourceGroup.Name} --name AllowContainerApp --start-ip-address $ip --end-ip-address $ip }} else {{ Write-Host 'No IP found' }}\""),
+        Triggers = new[] { containerApp.Id },
+    }, new CustomResourceOptions { DependsOn = containerApp });
+
+    // =========================================================================
+    // 13. DIAGNOSTIC SETTINGS — Logs → Log Analytics (solo si enableDiagnostics=true)
     // =========================================================================
     //
     // SQL Database:
@@ -359,54 +505,56 @@ return await Pulumi.Deployment.RunAsync(() =>
     //
     // Los logs llegan al Log Analytics workspace y se pueden consultar con KQL.
     //
-    var sqlDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-sql-{env}", new()
+    if (enableDiagnostics)
     {
-        // Nombre explícito → evita que Azure genere un nombre con sufijo aleatorio
-        // que causa conflictos 409 al recrear la infra
-        Name = $"diag-sql-{env}",
-        ResourceUri = sqlDatabase.Id,
-        WorkspaceId = logAnalytics.Id,
-        Logs = new[]
+        var sqlDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-sql-{env}", new()
         {
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "SQLInsights" },
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AutomaticTuning" },
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreRuntimeStatistics" },
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreWaitStatistics" },
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "Errors" },
-        },
-        Metrics = new[]
-        {
-            new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
-        },
-    });
+            // Nombre explícito → evita que Azure genere un nombre con sufijo aleatorio
+            // que causa conflictos 409 al recrear la infra
+            Name = $"diag-sql-{env}",
+            ResourceUri = sqlDatabase.Id,
+            WorkspaceId = logAnalytics.Id,
+            Logs = new[]
+            {
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "SQLInsights" },
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AutomaticTuning" },
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreRuntimeStatistics" },
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "QueryStoreWaitStatistics" },
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "Errors" },
+            },
+            Metrics = new[]
+            {
+                new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
+            },
+        });
 
-    var kvDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-kv-{env}", new()
-    {
-        Name = $"diag-kv-{env}",
-        ResourceUri = keyVault.Id,
-        WorkspaceId = logAnalytics.Id,
-        Logs = new[]
+        var kvDiag = new AzureNative.Monitor.DiagnosticSetting($"diag-kv-{env}", new()
         {
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AuditEvent" },
-            new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AzurePolicyEvaluationDetails" },
-        },
-        Metrics = new[]
-        {
-            new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
-        },
-    });
+            Name = $"diag-kv-{env}",
+            ResourceUri = keyVault.Id,
+            WorkspaceId = logAnalytics.Id,
+            Logs = new[]
+            {
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AuditEvent" },
+                new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AzurePolicyEvaluationDetails" },
+            },
+            Metrics = new[]
+            {
+                new AzureNative.Monitor.Inputs.MetricSettingsArgs { Enabled = true, Category = "AllMetrics" },
+            },
+        });
+    }
 
     // =========================================================================
     // OUTPUTS — Valores que devuelve el stack después del deploy
     // =========================================================================
     //
     // pulumi stack output → muestra estos valores
-    // La URL del Container App no está disponible aquí porque
-    // el Container App se crea via deploy.ps1, no via Pulumi.
     //
     return new Dictionary<string, object?>
     {
         ["resourceGroupName"] = resourceGroup.Name,
         ["acrName"] = containerRegistry.Name,
+        ["containerAppName"] = containerApp.Name,
     };
 });
