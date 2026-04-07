@@ -100,7 +100,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$AcrName   = "acrdoctorsapidev"
+$AcrName   = "acrdoctorsapi$Env"
 $RgName    = "rg-doctors-$Env"
 $CaName    = "ca-doctors-api-$Env"
 $CaeName   = "cae-doctors-api-$Env"
@@ -137,13 +137,20 @@ Write-Host "  Pulumi: OK" -ForegroundColor Green
 # PULUMI PASSPHRASE
 # ──────────────────────────────────────────────────────────────
 
+$passphraseTempFile = $null
 if (-not $env:PULUMI_CONFIG_PASSPHRASE -and -not $env:PULUMI_CONFIG_PASSPHRASE_FILE) {
     Write-Host "`n=== Pulumi Passphrase ===" -ForegroundColor Cyan
     $securePassphrase = Read-Host "Enter your Pulumi passphrase" -AsSecureString
-    $env:PULUMI_CONFIG_PASSPHRASE = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    $plainPassphrase = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassphrase)
     )
     $securePassphrase = $null
+
+    # Write passphrase to temp file instead of env var (prevents leak to child processes)
+    $passphraseTempFile = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($passphraseTempFile, $plainPassphrase)
+    $plainPassphrase = $null
+    $env:PULUMI_CONFIG_PASSPHRASE_FILE = $passphraseTempFile
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -165,6 +172,12 @@ pulumi up --cwd infra --yes
 $exitCode = $LASTEXITCODE
 
 $ErrorActionPreference = $oldPref
+
+# Cleanup passphrase temp file (only if we created one)
+if ($passphraseTempFile) {
+    Remove-Item $passphraseTempFile -Force -ErrorAction SilentlyContinue
+    $env:PULUMI_CONFIG_PASSPHRASE_FILE = $null
+}
 
 if ($exitCode -ne 0) {
     Write-Error "Failed to provision infrastructure. Exit code: $exitCode"
@@ -189,7 +202,11 @@ az acr login --name $AcrName
 #   - Runtime stage: aspnet 10.0 (más liviana, ~200MB)
 
 Write-Host "`n=== Step 3: Build Docker image ===" -ForegroundColor Cyan
-docker build -t $ImageName . 2>&1 | Out-Null
+docker build -t $ImageName .
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Docker build failed. Exit code: $LASTEXITCODE"
+    exit 1
+}
 Write-Host "  Image built: $ImageName" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────────
@@ -198,7 +215,11 @@ Write-Host "  Image built: $ImageName" -ForegroundColor Green
 # Sube la imagen a Azure Container Registry.
 
 Write-Host "`n=== Step 4: Push to ACR ===" -ForegroundColor Cyan
-docker push $ImageName --quiet 2>&1 | Out-Null
+docker push $ImageName
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Docker push failed. Exit code: $LASTEXITCODE"
+    exit 1
+}
 Write-Host "  Image pushed to ACR" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────────

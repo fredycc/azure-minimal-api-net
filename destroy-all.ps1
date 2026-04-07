@@ -23,6 +23,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ──────────────────────────────────────────────────────────────
+# PULUMI PASSPHRASE (same pattern as deploy.ps1)
+# ──────────────────────────────────────────────────────────────
+
+$passphraseTempFile = $null
+if (-not $env:PULUMI_CONFIG_PASSPHRASE -and -not $env:PULUMI_CONFIG_PASSPHRASE_FILE) {
+    Write-Host "=== Pulumi Passphrase ===" -ForegroundColor Cyan
+    $securePassphrase = Read-Host "Enter your Pulumi passphrase" -AsSecureString
+    $plainPassphrase = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassphrase)
+    )
+    $securePassphrase = $null
+
+    $passphraseTempFile = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($passphraseTempFile, $plainPassphrase)
+    $plainPassphrase = $null
+    $env:PULUMI_CONFIG_PASSPHRASE_FILE = $passphraseTempFile
+}
+
+# ──────────────────────────────────────────────────────────────
+
 $location = switch ($Env) {
     "dev"   { "westus2" }
     "prod"  { "eastus" }
@@ -33,6 +54,17 @@ $vaultName = "kv-doctors-api-$Env"
 
 Write-Host "=== Step 1: pulumi destroy ===" -ForegroundColor Cyan
 pulumi destroy --cwd infra --yes
+$destroyExitCode = $LASTEXITCODE
+
+# Cleanup passphrase temp file
+if ($passphraseTempFile) {
+    Remove-Item $passphraseTempFile -Force -ErrorAction SilentlyContinue
+    $env:PULUMI_CONFIG_PASSPHRASE_FILE = $null
+}
+
+if ($destroyExitCode -ne 0) {
+    Write-Warning "pulumi destroy exited with code $destroyExitCode. Continuing cleanup..."
+}
 
 Write-Host "`n=== Step 2: Cleanup soft-deleted resources ===" -ForegroundColor Cyan
 
@@ -62,3 +94,7 @@ else {
 Write-Host "`n=== Cleanup complete ===" -ForegroundColor Green
 Write-Host "`nVerifying:" -ForegroundColor Cyan
 az keyvault list-deleted --query "[].name" -o tsv
+
+Write-Host "`n⚠️  NOTE: Other Azure resources (SQL Server, Storage) may also be soft-deleted." -ForegroundColor Yellow
+Write-Host "   If you can't recreate them, check:" -ForegroundColor Gray
+Write-Host '   az keyvault list-deleted --query "[].{name:name, location:properties.location}" -o table'  -ForegroundColor Gray

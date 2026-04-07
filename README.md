@@ -233,66 +233,72 @@ azure-minimal-api-net/
 
 ## Infrastructure
 
-### Azure Resources (Pulumi)
+### Azure Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  rg-doctors-dev                                  Resource Group (westus2)   │
-│                                                                              │
-│  ├── acrdoctorsapidev                            Container Registry (Basic)  │
-│  │   ├── AdminUserEnabled: true (temporary)                                  │
-│  │   └── doctors-api:latest (or imageTag from config)                        │
-│  │                                                                          │
-│  ├── law-doctors-api-dev                         Log Analytics Workspace     │
-│  │   └── SKU: PerGB2018 (pay-per-use)                                       │
-│  │                                                                          │
-│  ├── sql-doctors-api-dev                         SQL Server                  │
-│  │   ├── sqldb-doctors-dev                       SQL Database (Serverless)   │
-│  │   │   ├── AutoPauseDelay: 60 min              ← $0 when idle              │
-│  │   │   ├── MinCapacity: 0.5 vCores             ← Minimum when active       │
-│  │   │   ├── MaxSize: 2 GB                       ← Enough for dev            │
-│  │   │   └── diag-sql-dev → Log Analytics         ← Diagnostics (5 categories)│
-│  │   └── fw-allow-azure (0.0.0.0–0.0.0.0)       ← AllowAzureServices        │
-│  │                                                                          │
-│  ├── kv-doctors-api-dev                          Key Vault (RBAC mode)       │
-│  │   ├── EnableRbacAuthorization: true                                       │
-│  │   ├── sql-connection-string (secret)                                      │
-│  │   ├── jwt-signing-key-dev (secret) ← JWT token signing                   │
-│  │   ├── kvadmin-dev → User (Key Vault Secrets Officer)                      │
-│  │   └── diag-kv-dev → Log Analytics             ← Audit logs                │
-│  │                                                                          │
-│  └── cae-doctors-api-dev                         Container App Environment   │
-│                                                                              │
-│  └── Tags: environment=dev, project=azure-minimal-api-net, managed-by=pulumi │
-│                                                                              │
-│  Outputs:                                                                    │
-│  ├── acrName: acrdoctorsapidev                                               │
-│  └── resourceGroupName: rg-doctors-dev                                      │
-└──────────────────────────────────────────────────────────────────────────────┘
+                        ┌─────────────────────────────────────────────┐
+                        │            INTERNET                         │
+                        │  Usuario / Browser / API Client             │
+                        └──────────────────┬──────────────────────────┘
+                                           │ HTTPS (443)
+                                           ▼
+                        ┌──────────────────────────────────────────────┐
+                        │  Container App (ca-doctors-api-{env})        │
+                        │  .NET 10 Minimal API                        │
+                        │  Port 8080 │ Managed Identity │ Scale 0-N   │
+                        └──┬─────┬─────┬──────────────────────────────┘
+                           │     │     │
+              ┌────────────┘     │     └────────────┐
+              │                  │                   │
+              ▼                  ▼                   ▼
+   ┌──────────────────┐ ┌──────────────┐  ┌───────────────────┐
+   │  Container       │ │  Azure SQL   │  │   Key Vault       │
+   │  Registry (ACR)  │ │  Serverless  │  │   (RBAC mode)     │
+   │                  │ │              │  │                   │
+   │  docker pull     │ │  Auto-pause  │  │  • sql-conn-str   │
+   │  via AcrPull     │ │  60min idle  │  │  • jwt-sign-key   │
+   │  role (RBAC)     │ │  1-5 GB      │  │                   │
+   └──────────────────┘ └──────────────┘  └───────────────────┘
+              │                  │                   │
+              └──────────────────┼───────────────────┘
+                                 │  (si diagnostics habilitado)
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │  Log Analytics Workspace     │
+                  │  SQL logs + KV audit events  │
+                  └──────────────────────────────┘
 ```
 
-### Azure Resources (deploy.ps1 — Azure CLI)
+### Resources by Cost Mode
 
-El Container App se crea via Azure CLI (no Pulumi) porque necesita la imagen
-Docker que aún no existe cuando se corre `pulumi up`.
+| Resource | nano ($3-5) | mini ($5-8) | normal ($10-15) | full ($25-40) |
+|----------|:-----------:|:-----------:|:---------------:|:-------------:|
+| Resource Group | ✅ | ✅ | ✅ | ✅ |
+| Container App | 0-1 replicas | 0-2 replicas | 1-5 replicas | 2-10 replicas |
+| Container App CPU/RAM | 0.25 / 0.5Gi | 0.25 / 0.5Gi | 0.25 / 0.5Gi | 0.5 / 1Gi |
+| Container Registry (ACR Basic) | ✅ | ✅ | ✅ | ✅ |
+| SQL Server | ✅ | ✅ | ✅ | ✅ |
+| SQL Database (Serverless) | 1 GB | 2 GB | 2 GB | 5 GB |
+| Key Vault (RBAC) | ✅ | ✅ | ✅ | ✅ |
+| Log Analytics | ✅ | ✅ | ✅ | ✅ |
+| Container App Environment | ✅ | ✅ | ✅ | ✅ |
+| **DiagnosticSettings** | ❌ | ❌ | ✅ | ✅ |
+| **RBAC roles** (AcrPull, KV User) | ✅ | ✅ | ✅ | ✅ |
+
+> **Key difference**: `nano` y `mini` desactivan DiagnosticSettings para ahorrar ~$2-5/mes.
+> `normal` y `full` los activan para tener logs de SQL y Key Vault en Log Analytics.
+
+### Data Flow
 
 ```
-  └── ca-doctors-api-dev                      Container App (creado por deploy.ps1)
-      ├── Image: acrdoctorsapidev.azurecr.io/doctors-api:{Tag}
-      ├── Port: 8080
-      ├── Registry: acrdoctorsapidev.azurecr.io (con credenciales admin)
-      ├── Env:
-      │   ├── ASPNETCORE_ENVIRONMENT=Development
-      │   ├── ConnectionStrings__DefaultConnection (secretref → KV secret)
-      │   └── JwtSettings__SigningKey (secretref → KV secret)
-      ├── Secrets:
-      │   ├── sql-connection-string → KV sql-conn-dev-westus2
-      │   └── jwt-signing-key → KV jwt-signing-key-dev
-      ├── Scale: 1–5 replicas
-      └── fw-allow-ca → SQL firewall rule (CA outbound IP)
+1. Request → Container App (HTTPS, external ingress)
+2. Container App → ACR: Pull Docker image (via SystemAssigned MI + AcrPull role)
+3. Container App → SQL: Query data (connection string from CA secret)
+4. Container App → Key Vault: Read secrets (via MI + KeyVaultSecretsUser role)
+5. SQL + Key Vault → Log Analytics: Audit/diagnostic logs (if enabled)
 ```
 
-> **infra/Program.cs** is fully documented with 12 sections explaining architecture, each resource, security, and costs. Read the file to understand each decision.
+> **infra/Program.cs** is fully documented with 16 sections explaining architecture, each resource, security, and costs. Read the file to understand each decision.
 
 ### Security Features
 
@@ -302,7 +308,7 @@ Docker que aún no existe cuando se corre `pulumi up`.
 | **Endpoint Protection** | `.RequireAuthorization()` on POST/PUT/DELETE | $0 |
 | **Swagger Security** | NSwag Bearer scheme → Authorize button | $0 |
 | **Managed Identity** | SystemAssigned on Container App | $0 |
-| **ACR Pull via RBAC** | AcrPull role (no admin credentials) | $0 |
+| **ACR Pull via RBAC** | AcrPull role (admin disabled) | $0 |
 | **Key Vault RBAC** | EnableRbacAuthorization = true | $0 |
 | **Secret Reference** | Connection string + JWT key via SecretRef (no plaintext) | $0 |
 | **Resource Tags** | environment, project, managed-by | $0 |
@@ -326,10 +332,8 @@ Docker que aún no existe cuando se corre `pulumi up`.
 
 | Item | Dev | Production |
 |------|-----|-----------|
-| ACR Admin | Enabled (temporary) | Disable + use AcrPull only |
 | SQL Firewall | AllowAzureServices (0.0.0.0) | VNet + Private Endpoint (~$30-50/mo) |
 | SQL Auth | Admin password | Azure AD auth |
-| ASPNETCORE_ENVIRONMENT | Development | Production |
 | ACR Tier | Basic ($5/mo) | Standard ($150/mo, vulnerability scanning) |
 
 ---
@@ -520,14 +524,10 @@ pulumi config set --secret doctors-api-infra:jwtSigningKey "tu-jwt-key-aqui"
 # → Strong random key, e.g.: openssl rand -base64 48
 ```
 
-**5. Purge old Key Vault (if exists from previous deployment)**
+**5. Run deploy**
 
-```bash
-# Check if a soft-deleted Key Vault exists
-az keyvault list-deleted --query "[?name=='kv-doctors-api-dev']" -o table
-
-# If found, purge it (may take 1-2 minutes)
-az keyvault purge --name kv-doctors-api-dev --location westus2
+```powershell
+.\deploy.ps1
 ```
 
 ### Run Locally
@@ -568,149 +568,60 @@ curl -X POST http://localhost:5000/api/doctors \
 
 ### Deploy to Azure
 
-**Using deploy.ps1 (recommended):**
-
 ```powershell
-# Full deploy (infra + build + push + container app creation)
+# Deploy to dev (default)
 .\deploy.ps1
 
-# With specific tag
+# Deploy with version tag
 .\deploy.ps1 -Tag "1.2.0"
 
-# The script:
-#   1. Creates/updates infra via Pulumi (RG, ACR, SQL, KV, CAE, etc.)
-#   2. Builds Docker image
-#   3. Pushes to ACR
-#   4. Creates Container App via Azure CLI (with KV secret)
-#   5. Configures SQL firewall rule for Container App outbound IP
-#   6. Verifies API is responding
+# Deploy to production
+.\deploy.ps1 -Env prod -Tag "1.0.0"
 ```
 
-**Manual (step by step):**
+El script hace todo automáticamente:
+1. Crea/actualiza infraestructura con Pulumi (RG, ACR, SQL, KV, CAE, Container App)
+2. Construye la imagen Docker
+3. Push a Azure Container Registry
+4. Actualiza el Container App con la nueva imagen
+5. Verifica que la API responda
+
+**Cambiar solo la imagen (sin cambios de infra):**
 
 ```powershell
-# 1. Create/update infrastructure (no Container App)
-pulumi up --cwd infra --yes
-
-# 2. Build Docker image
-docker build -t acrdoctorsapidev.azurecr.io/doctors-api:latest .
-
-# 3. Push to ACR
-az acr login --name acrdoctorsapidev
-docker push acrdoctorsapidev.azurecr.io/doctors-api:latest
-
-# 4. Get KV secrets
-$SQL_CONN = az keyvault secret show --vault-name kv-doctors-api-dev --name "sql-conn-dev-westus2" --query "value" -o tsv
-$JWT_KEY = az keyvault secret show --vault-name kv-doctors-api-dev --name "jwt-signing-key-dev" --query "value" -o tsv
-
-# 5. Create Container App
-az containerapp create `
-    --name ca-doctors-api-dev `
-    --resource-group rg-doctors-dev `
-    --environment cae-doctors-api-dev `
-    --image acrdoctorsapidev.azurecr.io/doctors-api:latest `
-    --target-port 8080 `
-    --ingress external `
-    --min-replicas 1 --max-replicas 5 `
-    --cpu 0.25 --memory "0.5Gi" `
-    --registry-server "acrdoctorsapidev.azurecr.io" `
-    --env-vars ASPNETCORE_ENVIRONMENT=Development "ConnectionStrings__DefaultConnection=secretref:sql-connection-string" "JwtSettings__SigningKey=secretref:jwt-signing-key" `
-    --secrets "sql-connection-string=$SQL_CONN" "jwt-signing-key=$JWT_KEY"
-
-# 6. Get URL
-az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "properties.configuration.ingress.fqdn" -o tsv
-```
-
-**Change image tag only (no infra changes):**
-
-```powershell
-pulumi config set imageTag "v1.2.3" --cwd infra
 .\deploy.ps1 -Tag "v1.2.3"
 ```
 
 ### Validate Deployment
 
 ```powershell
-# Get current URL
-$URL = "https://$(az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-api-dev --query 'properties.configuration.ingress.fqdn' -o tsv)"
+# Get the URL
+$URL = "https://$(az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query 'properties.configuration.ingress.fqdn' -o tsv)"
 
-# Health check (public endpoint)
+# Health check
 curl "$URL/api/doctors"
 
-# Swagger UI
-curl "$URL/swagger"
+# Get auth token and create a doctor
+$TOKEN = (curl -s -X POST "$URL/auth/login" -H "Content-Type: application/json" -d '{"username":"admin","password":"admin123"}' | ConvertFrom-Json).token
 
-# Get auth token
-$TOKEN = (curl -s -X POST "$URL/auth/login" `
-  -H "Content-Type: application/json" `
-  -d '{"username":"admin","password":"admin123"}' | ConvertFrom-Json).token
-
-# Create a doctor (with auth)
 curl -X POST "$URL/api/doctors" `
   -H "Authorization: Bearer $TOKEN" `
   -H "Content-Type: application/json" `
   -d '{"firstName":"María","lastName":"González","licenseNumber":"MP-67890","specialty":"Neurología"}'
-
-# Verify mutation without auth → 401
-curl -X POST "$URL/api/doctors" `
-  -H "Content-Type: application/json" `
-  -d '{"firstName":"Test"}'
 ```
 
 ### Destroy & Recreate Infrastructure
 
-> ⚠️ **DANGER** — This section destroys ALL Azure resources for the project.
-> You will lose: databases, secrets, Docker images, logs. **This cannot be undone.**
->
-> Only use this if you need a full environment reset (e.g., corrupted Pulumi state,
-> accumulated changes you don't want to resolve one by one, or starting fresh).
-
-#### Option 1: `pulumi destroy` (recommended — clean destruction)
-
 ```powershell
-# Destroy all resources created by Pulumi
-pulumi destroy --cwd infra --yes
+# Destruir todo y limpiar recursos soft-deleted (Key Vault, etc.)
+.\destroy-all.ps1
 
-# Purge Key Vault (soft-delete retains it for 90 days)
-az keyvault purge --name kv-doctors-api-dev --no-wait
-
-# Verify everything was deleted
-az group show --name rg-doctors-dev  # Should return ResourceNotFound
+# Recrear desde cero
+.\deploy.ps1
 ```
 
-> `pulumi destroy` deletes resources from Azure AND removes them from Pulumi state.
-> Key Vault needs a separate purge because of Azure soft-delete policy.
-
-#### Option 2: Delete the Resource Group (faster, less clean)
-
-```powershell
-# ⚠️ THIS DELETES EVERYTHING — including resources Pulumi doesn't manage
-az group delete --name rg-doctors-dev --yes --no-wait
-
-# Purge Key Vault
-az keyvault purge --name kv-doctors-api-dev --no-wait
-
-# Wait for completion (may take 2-5 minutes)
-az group show --name rg-doctors-dev  # ResourceNotFound = done
-```
-
-> **Difference:** `pulumi destroy` is surgical (deletes only Pulumi-managed resources).
-> `az group delete` is nuclear (deletes EVERYTHING in the group, including manual resources).
-
-#### Recreate after destroy
-
-```powershell
-pulumi up --cwd infra --yes   # Create infrastructure
-.\deploy.ps1                  # Build, push, and deploy the app
-```
-
-> **If Pulumi state is corrupted** (resources exist in Azure but state is broken):
-> ```powershell
-> pulumi state delete --all --cwd infra --yes      # Clear state
-> az group delete --name rg-doctors-dev --yes      # Delete old resources
-> az keyvault purge --name kv-doctors-api-dev      # Purge soft-deleted KV
-> pulumi up --cwd infra --yes                      # Create fresh
-> ```
+> `destroy-all.ps1` ejecuta `pulumi destroy` y luego limpia automáticamente
+> recursos soft-deleted (Key Vault) que Azure retiene por 90 días.
 
 ---
 
