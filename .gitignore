@@ -53,3 +53,4 @@ appsettings.Development.json
 build.log
 .atl/
 sdd/
+.sdd/
