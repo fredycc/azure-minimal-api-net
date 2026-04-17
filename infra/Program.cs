@@ -7,11 +7,12 @@
 //
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARQUITECTURA (orden de creación)                                       ║
+// ║  TWO-TIER MULTI-STAGE DESIGN (new):                                     ║
+// ║    infra-shared (main) → ACR (acrmain) + LAW (law-main) + RG            ║
+// ║    infra-{env}         → RG, SQL, KV, CAE, ContainerApp (per env)       ║
 // ║                                                                         ║
-// ║  1. Resource Group        ← Contenedor lógico de todos los recursos     ║
-// ║  2. Log Analytics         ← Centraliza logs de diagnóstico              ║
-// ║  3. Container Registry    ← Almacena imágenes Docker (ACR)              ║
-// ║  4. SQL Server + DB       ← Base de datos serverless (auto-pausa)       ║
+// ║  1. Resource Group (per-env)                                            ║
+// ║  2. SQL Server + DB (serverless + auto-pause 60min for non-prod)        ║
 // ║  5. Firewall Rules        ← Controla acceso al SQL Server               ║
 // ║  6. Container App Env     ← Entorno donde corren los containers         ║
 // ║  7. Key Vault             ← Almacena secrets (RBAC, no AccessPolicies)  ║
@@ -25,9 +26,11 @@
 // ║ 15. Diagnostic Settings   ← Logs de SQL y KV → Log Analytics            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 //
-// COSTO ESTIMADO (ambiente dev):
-//   Idle:  ~$10/mes  (SQL serverless pausado, ACR Basic, KV Standard)
-//   Activo: ~$15-20/mes (con tráfico moderado)
+// COSTO ESTIMADO (multi-stage):
+//   Shared (always on): ~$7-10/mes (ACR Basic + LAW)
+//   Per-env dev/qa:     ~$8-15/mes (SQL serverless 60min auto-pause)
+//   Prod:               ~$25+/mes (no auto-pause)
+//   Total idle:         ~$15-25/mes
 //
 // SEGURIDAD:
 //   - Managed Identity en Container App (sin passwords hardcodeadas)
@@ -54,13 +57,23 @@ return await Pulumi.Deployment.RunAsync(() =>
     // Pulumi config set imageTag dev-0.1.0
     //
     var config = new Pulumi.Config();
-    var env = config.Require("env");                    // "dev" | "prod"
+    var env = config.Require("env");                    // "dev" | "qa" | "prod"
     var sqlAdmin = config.Require("sqlAdmin");           // Usuario admin del SQL Server
     var sqlPassword = config.RequireSecret("sqlPassword"); // Password del SQL (encriptado en state)
     var tenantId = config.Require("tenantId");           // Azure AD Tenant ID
     var location = config.Get("location") ?? "eastus";  // Región Azure (default: eastus)
     var costMode = config.Get("costMode") ?? "nano";    // Modo de costo: nano, mini, normal, full
-    
+
+    // =========================================================================
+    // SHARED INFRA REFERENCE (StackReference to infra-shared/main)
+    // =========================================================================
+    // This is the core of the multi-stage strategy: shared ACR + LAW.
+    var sharedRef = new StackReference("organization/azure-minimal-api-net-shared/main");
+    var acrName = sharedRef.GetOutput("acrName");
+    var acrId = sharedRef.GetOutput("acrId").Apply(x => x!.ToString()!);
+    var acrLoginServer = sharedRef.GetOutput("acrLoginServer");
+    var lawWorkspaceId = sharedRef.GetOutput("logAnalyticsWorkspaceId").Apply(x => x!.ToString()!);
+
     var clientConfig = AzureNative.Authorization.GetClientConfig.Invoke();
     var subscriptionId = clientConfig.Apply(c => c.SubscriptionId); // Para RBAC role definitions
 
@@ -135,8 +148,9 @@ return await Pulumi.Deployment.RunAsync(() =>
     Console.WriteLine();
 
     // SQL Serverless config (siempre optimizado para costos)
-    var sqlAutoPauseDelay = 60;  // Minutos antes de pausar
-    var sqlMinCapacity = 0.5;    // vCores mínimos cuando activo
+    // Per spec: 60 minutes for non-prod (dev, qa). Prod stays always on (null = no auto-pause).
+    var sqlAutoPauseDelay = env == "prod" ? (int?)null : 60;
+    
 
     // =========================================================================
     // 1. RESOURCE GROUP — Contenedor lógico de todos los recursos
@@ -152,48 +166,10 @@ return await Pulumi.Deployment.RunAsync(() =>
         Tags = tags,
     });
 
-    // =========================================================================
-    // 2. LOG ANALYTICS WORKSPACE — Centraliza logs de diagnóstico
-    // =========================================================================
+    // Note: LOG ANALYTICS and CONTAINER REGISTRY are now in infra-shared.
+    // They are referenced via StackReference (see top of file).
     //
-    // Recibe logs de SQL, Key Vault y Container App.
-    // SKU PerGB2018 = pay-per-use (pagas por GB ingerido, ~$2-5/mes en dev).
-    //
-    var logAnalytics = new AzureNative.OperationalInsights.Workspace($"law-doctors-api-{env}", new()
-    {
-        WorkspaceName = $"law-doctors-api-{env}",
-        ResourceGroupName = resourceGroup.Name,
-        Location = resourceGroup.Location,
-        Sku = new AzureNative.OperationalInsights.Inputs.WorkspaceSkuArgs
-        {
-            Name = AzureNative.OperationalInsights.WorkspaceSkuNameEnum.PerGB2018,
-        },
-        Tags = tags,
-    });
 
-    // =========================================================================
-    // 3. CONTAINER REGISTRY (ACR) — Almacena imágenes Docker
-    // =========================================================================
-    //
-    // Tier Basic: ~$5/mes (suficiente para dev, sin vulnerability scanning).
-    //
-    // AdminUserEnabled: false → autenticación vía Managed Identity + rol AcrPull.
-    // NUNCA usar admin credentials en un registry conectado a internet.
-    //
-    // Convención de nombres: sin guiones (acrdoctorsapidev, no acr-doctors-api-dev)
-    //
-    var containerRegistry = new AzureNative.ContainerRegistry.Registry($"acrdoctorsapi{env}", new()
-    {
-        RegistryName = $"acrdoctorsapi{env}",
-        ResourceGroupName = resourceGroup.Name,
-        Location = resourceGroup.Location,
-        Sku = new AzureNative.ContainerRegistry.Inputs.SkuArgs
-        {
-            Name = AzureNative.ContainerRegistry.SkuName.Basic,
-        },
-        AdminUserEnabled = false,
-        Tags = tags,
-    });
 
     // =========================================================================
     // 4. SQL SERVER — Instancia que aloja las bases de datos
@@ -237,20 +213,10 @@ return await Pulumi.Deployment.RunAsync(() =>
         EndIpAddress = "0.0.0.0",
     });
 
-    // =========================================================================
-    // 6. SQL DATABASE — Base de datos real (Serverless)
-    // =========================================================================
-    //
-    // Tier: GeneralPurpose Serverless (GP_S_Gen5_2)
-    //   - Auto-pausa después de 60 min de inactividad → $0 cuando no hay tráfico
-    //   - MinCapacity: 0.5 vCores (mínimo cuando está activo)
-    //   - MaxSizeBytes: 2 GB (suficiente para dev/demo)
-    //
-    // Cuando la API conecta, la DB "despierta" automáticamente (~30 segundos).
-    //
-    var sqlDatabase = new AzureNative.Sql.Database($"sqldb-doctors-{env}", new()
+    
+    var sqlDatabase = new AzureNative.Sql.Database("sqldb-doctors-$env", new()
     {
-        DatabaseName = $"sqldb-doctors-{env}",
+        DatabaseName = "sqldb-doctors-$env",
         ServerName = sqlServer.Name,
         ResourceGroupName = resourceGroup.Name,
         Location = resourceGroup.Location,
@@ -260,10 +226,11 @@ return await Pulumi.Deployment.RunAsync(() =>
             Tier = "GeneralPurpose",
         },
         AutoPauseDelay = sqlAutoPauseDelay,
-        MinCapacity = sqlMinCapacity,
+        MinCapacity = 0.5,
         MaxSizeBytes = sqlMaxSize,
         Tags = tags,
     });
+
 
     // =========================================================================
     // 7. CONTAINER APP ENVIRONMENT — Entorno donde corren los containers
@@ -432,7 +399,7 @@ return await Pulumi.Deployment.RunAsync(() =>
                     Image = "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest",
                     Env = new[]
                     {
-                        new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "ASPNETCORE_ENVIRONMENT", Value = env == "prod" ? "Production" : "Development" },
+                        new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "ASPNETCORE_ENVIRONMENT", Value = (env == "qa" || env == "prod") ? "Production" : "Development" },
                         new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "ConnectionStrings__DefaultConnection", SecretRef = "sql-connection-string" },
                         new AzureNative.App.Inputs.EnvironmentVarArgs { Name = "JwtSettings__SigningKey", SecretRef = "jwt-signing-key" },
                     },
@@ -468,7 +435,7 @@ return await Pulumi.Deployment.RunAsync(() =>
         // "ServicePrincipal" es correcto para SystemAssigned Managed Identity en Azure RBAC
         PrincipalType = "ServicePrincipal",
         RoleDefinitionId = Output.Format($"/subscriptions/{subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"),
-        Scope = containerRegistry.Id,
+        Scope = acrId,  // Now from shared stack (full resource ID required for RBAC)
     });
 
     // =========================================================================
@@ -551,7 +518,7 @@ return await Pulumi.Deployment.RunAsync(() =>
             // que causa conflictos 409 al recrear la infra
             Name = $"diag-sql-{env}",
             ResourceUri = sqlDatabase.Id,
-            WorkspaceId = logAnalytics.Id,
+            WorkspaceId = lawWorkspaceId,
             Logs = new[]
             {
                 new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "SQLInsights" },
@@ -570,7 +537,7 @@ return await Pulumi.Deployment.RunAsync(() =>
         {
             Name = $"diag-kv-{env}",
             ResourceUri = keyVault.Id,
-            WorkspaceId = logAnalytics.Id,
+            WorkspaceId = lawWorkspaceId,
             Logs = new[]
             {
                 new AzureNative.Monitor.Inputs.LogSettingsArgs { Enabled = true, Category = "AuditEvent" },
@@ -592,7 +559,7 @@ return await Pulumi.Deployment.RunAsync(() =>
     return new Dictionary<string, object?>
     {
         ["resourceGroupName"] = resourceGroup.Name,
-        ["acrName"] = containerRegistry.Name,
         ["containerAppName"] = containerApp.Name,
+        // acrName and others now come from shared stack via StackReference
     };
 });

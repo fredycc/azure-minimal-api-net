@@ -1,0 +1,28 @@
+# Pulumi Stack Configuration for PROD environment
+# =================================================
+# Production environment:
+# - ASPNETCORE_ENVIRONMENT=Production (Swagger disabled)
+# - SQL auto-pause DISABLED (always on for prod)
+# - Uses "normal" cost mode (more capacity)
+# - Use strong, unique passwords and rotate regularly.
+#
+# Initialize with:
+#   pulumi stack init prod --cwd infra
+#   pulumi config set doctors-api-infra:env prod --cwd infra
+#   pulumi config set doctors-api-infra:sqlAdmin prodadmin --cwd infra
+#   pulumi config set doctors-api-infra:tenantId "<your-tenant-id>" --cwd infra
+#   pulumi config set doctors-api-infra:costMode normal --cwd infra
+#   pulumi config set --secret doctors-api-infra:sqlPassword "UseAVeryStrongProdPassword123!"
+#   pulumi config set --secret doctors-api-infra:jwtSigningKey "UseAVeryLongAndRandomJWTSigningKeyHere!"
+
+config:
+  doctors-api-infra:env: prod
+  doctors-api-infra:sqlAdmin: prodadmin
+  doctors-api-infra:tenantId: "c9bcaf84-7cff-41a8-8822-bbc098f96b7a"
+  doctors-api-infra:location: eastus
+  doctors-api-infra:costMode: normal
+  doctors-api-infra:imageTag: prod-v1.0.0
+  doctors-api-infra:sqlPassword:
+    secure: <set-with-pulumi-config-set--secret>
+  doctors-api-infra:jwtSigningKey:
+    secure: <set-with-pulumi-config-set--secret>

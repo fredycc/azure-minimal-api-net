@@ -1,0 +1,27 @@
+# Pulumi Stack Configuration for QA environment
+# ================================================
+# QA environment runs with ASPNETCORE_ENVIRONMENT=Production (no Swagger)
+# SQL auto-pause enabled (60 minutes) per spec.
+# Uses "mini" cost mode by default.
+#
+# Initialize with:
+#   pulumi stack init qa --cwd infra
+#   pulumi config set doctors-api-infra:env qa --cwd infra
+#   pulumi config set doctors-api-infra:sqlAdmin doctorsadmin --cwd infra
+#   pulumi config set doctors-api-infra:tenantId "<your-tenant-id>" --cwd infra
+#   pulumi config set --secret doctors-api-infra:sqlPassword "YourStrongQA_P@ssw0rd"
+#   pulumi config set --secret doctors-api-infra:jwtSigningKey "your-qa-jwt-signing-key-here"
+#
+# Cost mode can be changed with: pulumi config set doctors-api-infra:costMode mini
+
+config:
+  doctors-api-infra:env: qa
+  doctors-api-infra:sqlAdmin: doctorsadmin
+  doctors-api-infra:tenantId: "c9bcaf84-7cff-41a8-8822-bbc098f96b7a"  # Update with your tenant
+  doctors-api-infra:location: westus2
+  doctors-api-infra:costMode: mini
+  doctors-api-infra:imageTag: qa-latest
+  doctors-api-infra:sqlPassword:
+    secure: <set-with-pulumi-config-set--secret>
+  doctors-api-infra:jwtSigningKey:
+    secure: <set-with-pulumi-config-set--secret>

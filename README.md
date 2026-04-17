@@ -233,40 +233,81 @@ azure-minimal-api-net/
 
 ## Infrastructure
 
-### Azure Architecture
+### Multi-Stage Deployment Architecture
 
+The project uses a **Two-Tier Infrastructure** strategy via Pulumi `StackReference` to separate global resources from environment-specific ones. This ensures cost-efficiency, avoids global naming conflicts, and provides stability across stages.
+
+```mermaid
+graph TD
+    subgraph Shared Infrastructure [infra-shared stack]
+        RG_Shared[rg-core-shared]
+        ACR[acrfcoremain<br>Azure Container Registry]
+        LAW[law-core-main<br>Log Analytics Workspace]
+        
+        RG_Shared --> ACR
+        RG_Shared --> LAW
+    end
+
+    subgraph Dev Environment [infra stack: dev]
+        RG_Dev[rg-doctors-dev]
+        SQL_Dev[(SQL Serverless<br>60m auto-pause)]
+        CA_Dev[Container App<br>ASPNETCORE_ENVIRONMENT=Development]
+        KV_Dev[Key Vault]
+        
+        RG_Dev --> SQL_Dev
+        RG_Dev --> CA_Dev
+        RG_Dev --> KV_Dev
+    end
+
+    subgraph QA Environment [infra stack: qa]
+        RG_QA[rg-doctors-qa]
+        SQL_QA[(SQL Serverless<br>60m auto-pause)]
+        CA_QA[Container App<br>ASPNETCORE_ENVIRONMENT=Production]
+        
+        RG_QA --> SQL_QA
+        RG_QA --> CA_QA
+    end
+
+    CA_Dev -. "Pulls image" .-> ACR
+    SQL_Dev -. "Sends logs" .-> LAW
+    CA_QA -. "Pulls image" .-> ACR
 ```
-                        ┌─────────────────────────────────────────────┐
-                        │            INTERNET                         │
-                        │  Usuario / Browser / API Client             │
-                        └──────────────────┬──────────────────────────┘
-                                           │ HTTPS (443)
-                                           ▼
-                        ┌──────────────────────────────────────────────┐
-                        │  Container App (ca-doctors-api-{env})        │
-                        │  .NET 10 Minimal API                        │
-                        │  Port 8080 │ Managed Identity │ Scale 0-N   │
-                        └──┬─────┬─────┬──────────────────────────────┘
-                           │     │     │
-              ┌────────────┘     │     └────────────┐
-              │                  │                   │
-              ▼                  ▼                   ▼
-   ┌──────────────────┐ ┌──────────────┐  ┌───────────────────┐
-   │  Container       │ │  Azure SQL   │  │   Key Vault       │
-   │  Registry (ACR)  │ │  Serverless  │  │   (RBAC mode)     │
-   │                  │ │              │  │                   │
-   │  docker pull     │ │  Auto-pause  │  │  • sql-conn-str   │
-   │  via AcrPull     │ │  60min idle  │  │  • jwt-sign-key   │
-   │  role (RBAC)     │ │  1-5 GB      │  │                   │
-   └──────────────────┘ └──────────────┘  └───────────────────┘
-              │                  │                   │
-              └──────────────────┼───────────────────┘
-                                 │  (si diagnostics habilitado)
-                                 ▼
-                  ┌──────────────────────────────┐
-                  │  Log Analytics Workspace     │
-                  │  SQL logs + KV audit events  │
-                  └──────────────────────────────┘
+
+1.  **Shared Infrastructure (`infra-shared`)**:
+    *   **Purpose**: Resources that are shared across all environments (dev, qa, prod) to avoid duplication, reduce costs, and avoid global Azure naming conflicts.
+    *   **Resources**: `rg-core-shared` (Resource Group), `acrfcoremain` (Container Registry), `law-core-main` (Log Analytics).
+2.  **Environment Infrastructure (`infra`)**:
+    *   **Purpose**: Isolated resources for each stage (`dev`, `qa`, `prod`).
+    *   **Resources**: Dedicated Resource Group (`rg-doctors-{env}`), Azure SQL Serverless (auto-paused in non-prod), Key Vault, Container App Environment, and the Container App.
+    *   **Reference**: These stacks use `StackReference("organization/azure-minimal-api-net-shared/main")` to dynamically retrieve the ACR and LAW identities from the shared stack.
+
+### Deploying to Different Environments
+
+Deployment is fully orchestrated via `deploy.ps1`. The script includes a **Fail-Fast** mechanism to verify that shared dependencies exist before starting.
+
+*   **Development**: `.\deploy.ps1 -Env dev`
+*   **Quality Assurance**: `.\deploy.ps1 -Env qa`
+*   **Production**: `.\deploy.ps1 -Env prod`
+
+*(Note: QA and Prod enforce `ASPNETCORE_ENVIRONMENT=Production` which safely disables Swagger and optimizes the API).*
+
+### First-Time Setup
+
+If you are deploying for the exact first time, you must create the shared stack first. You can do this in one command by appending the `-DeployShared` flag:
+
+```powershell
+# 1. Initialize the shared stack (first time only)
+cd infra-shared
+pulumi stack init main
+cd ..
+
+# 2. Initialize your target environment stack
+cd infra
+pulumi stack init dev
+cd ..
+
+# 3. Deploy everything (Shared + Env)
+.\deploy.ps1 -DeployShared -Env dev
 ```
 
 ### Resources by Cost Mode
@@ -569,27 +610,28 @@ curl -X POST http://localhost:5000/api/doctors \
 ### Deploy to Azure
 
 ```powershell
-# Deploy to dev (default)
-.\deploy.ps1
+# Deploy to dev (requires -Env parameter now)
+.\deploy.ps1 -Env dev
 
 # Deploy with version tag
-.\deploy.ps1 -Tag "1.2.0"
+.\deploy.ps1 -Env dev -Tag "1.2.0"
 
-# Deploy to production
+# Deploy to production (using shared ACR)
 .\deploy.ps1 -Env prod -Tag "1.0.0"
 ```
 
 El script hace todo automáticamente:
-1. Crea/actualiza infraestructura con Pulumi (RG, ACR, SQL, KV, CAE, Container App)
-2. Construye la imagen Docker
-3. Push a Azure Container Registry
-4. Actualiza el Container App con la nueva imagen
-5. Verifica que la API responda
+1. Crea/actualiza infraestructura compartida (si `-DeployShared` es usado).
+2. Crea/actualiza infraestructura del entorno (RG, SQL Serverless, KV, CAE, Container App).
+3. Construye la imagen Docker.
+4. Push a Azure Container Registry (Shared).
+5. Actualiza el Container App con la nueva imagen.
+6. Verifica que la API responda.
 
 **Cambiar solo la imagen (sin cambios de infra):**
 
 ```powershell
-.\deploy.ps1 -Tag "v1.2.3"
+.\deploy.ps1 -Env dev -Tag "v1.2.3"
 ```
 
 ### Validate Deployment
@@ -613,11 +655,14 @@ curl -X POST "$URL/api/doctors" `
 ### Destroy & Recreate Infrastructure
 
 ```powershell
-# Destruir todo y limpiar recursos soft-deleted (Key Vault, etc.)
-.\destroy-all.ps1
+# Destruir entorno dev (requiere confirmación)
+.\destroy-all.ps1 -Env dev
+
+# Destruir entorno + infraestructura compartida (peligroso en prod)
+.\destroy-all.ps1 -Env dev -DestroyShared
 
 # Recrear desde cero
-.\deploy.ps1
+.\deploy.ps1 -DeployShared -Env dev
 ```
 
 > `destroy-all.ps1` ejecuta `pulumi destroy` y luego limpia automáticamente
@@ -776,16 +821,49 @@ config:
 ```powershell
 # Check Container App status
 az containerapp show --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "{status: properties.runningStatus, revision: properties.latestRevisionName, fqdn: properties.configuration.ingress.fqdn}" -o table
-
-# Check revision status
-az containerapp revision list --name ca-doctors-api-dev --resource-group rg-doctors-dev --query "[].{name: name, active: properties.active, health: properties.healthState}" -o table
-
-# Check container logs (last 30 lines)
-az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-dev --type console --tail 30
-
-# Check system logs (infrastructure errors)
-az containerapp logs show --name ca-doctors-api-dev --resource-group rg-doctors-dev --type system --tail 20
 ```
+
+### Advanced Infrastructure Fixes (Pulumi & Azure)
+
+#### 1. Pulumi State Desync ("ResourceGroupNotFound" or similar 404s)
+**Symptom**: Pulumi says `unchanged` or `created successfully`, but Azure throws `404 Not Found` when trying to assign roles or use resources.
+**Cause**: You manually deleted a resource (e.g., `rg-core-shared`) via the Azure Portal, but Pulumi's local state still thinks it exists.
+**Fix**: Force Pulumi to reconcile its state with Azure reality:
+```powershell
+cd infra-shared # or infra
+pulumi refresh --stack main --yes
+```
+*(Note: `deploy.ps1` now runs `--refresh` automatically to prevent this!)*
+
+#### 2. Key Vault 409 Conflict ("Already exists in deleted state")
+**Symptom**: Pulumi fails to create `kv-doctors-api-dev` with a `409 ConflictError`.
+**Cause**: Key Vaults have soft-delete enabled by default. Deleting a resource group does not permanently delete the vault; Azure holds the name hostage for 90 days.
+**Fix**: Purge the vault manually from Azure's recycle bin:
+```powershell
+az keyvault purge --name kv-doctors-api-dev --location westus2 --no-wait
+```
+
+#### 3. Pulumi Destroy Fails on Key Vault Secrets ("Tenant not found" or Auth errors)
+**Symptom**: `pulumi destroy` fails to delete `sql-conn-dev` or `jwt-signing-key-dev` because of AADSTS90002 or auth errors.
+**Cause**: The secret was originally created with an incorrect `tenantId` in the Pulumi config. `pulumi destroy` uses the old, burned-in tenant ID from the state file, so fixing the config won't help.
+**Fix**: Perform "surgery" on the Pulumi state to make it forget the secrets, then destroy the rest normally:
+```powershell
+cd infra
+# Force Pulumi to forget the broken secrets
+pulumi state delete "urn:pulumi:dev::doctors-api-infra::azure-native:keyvault:Secret::sql-conn-dev" --force --yes
+pulumi state delete "urn:pulumi:dev::doctors-api-infra::azure-native:keyvault:Secret::jwt-signing-key-dev" --force --yes
+
+cd ..
+# Now destroy the rest (Azure will delete the secrets when it deletes the Key Vault)
+.\destroy-all.ps1 -Env dev
+```
+
+#### 4. Pulumi Cipher Error ("message authentication failed")
+**Symptom**: `error: validating stack config: cipher: message authentication failed`
+**Cause**: The `Pulumi.dev.yaml` was edited manually or the passphrase was lost/changed, making the local state impossible to decrypt.
+**Fix**: 
+1. If the environment is expendable (like `dev`), delete the stack forcefully: `pulumi stack rm dev --force`
+2. Re-init the stack (`pulumi stack init dev`), set the config values again, and run `.\deploy.ps1 -Env dev`.
 
 ### Common Errors and Solutions
 

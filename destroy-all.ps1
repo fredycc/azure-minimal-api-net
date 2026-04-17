@@ -18,8 +18,12 @@
 #>
 
 param(
-    [string]$Env = "dev"
+    [ValidateSet('dev','qa','prod')]
+    [string]$Env,
+    [switch]$DestroyShared
 )
+
+if (-not $Env) { Write-Error 'Debe especificar el ambiente explícitamente: .\destroy-all.ps1 -Env dev|qa|prod'; exit 1 }
 
 $ErrorActionPreference = "Stop"
 
@@ -46,14 +50,29 @@ if (-not $env:PULUMI_CONFIG_PASSPHRASE -and -not $env:PULUMI_CONFIG_PASSPHRASE_F
 
 $location = switch ($Env) {
     "dev"   { "westus2" }
+    "qa"    { "westus2" }
     "prod"  { "eastus" }
     default { "westus2" }
 }
 
 $vaultName = "kv-doctors-api-$Env"
 
-Write-Host "=== Step 1: pulumi destroy ===" -ForegroundColor Cyan
-pulumi destroy --cwd infra --yes
+Write-Host "=== Multi-Stage Destroy: Environment '$Env' (Shared remains protected) ===" -ForegroundColor Cyan
+
+if ($DestroyShared) {
+    Write-Host "`n⚠️  WARNING: You are about to destroy SHARED infrastructure (ACR + LAW)" -ForegroundColor Red
+    Write-Host "   This affects ALL environments (dev, qa, prod)!" -ForegroundColor Red
+    $confirm = Read-Host "Type 'DESTROY-SHARED' to confirm"
+    if ($confirm -ne "DESTROY-SHARED") {
+        Write-Host "Aborted." -ForegroundColor Yellow
+        exit 0
+    }
+    Write-Host "  Destroying shared infrastructure..." -ForegroundColor Red
+    pulumi destroy --cwd infra-shared --stack main --yes
+}
+
+Write-Host "`n=== Step 1: pulumi destroy environment stack ($Env) ===" -ForegroundColor Cyan
+pulumi destroy --cwd infra --stack $Env --yes
 $destroyExitCode = $LASTEXITCODE
 
 # Cleanup passphrase temp file
@@ -66,7 +85,7 @@ if ($destroyExitCode -ne 0) {
     Write-Warning "pulumi destroy exited with code $destroyExitCode. Continuing cleanup..."
 }
 
-Write-Host "`n=== Step 2: Cleanup soft-deleted resources ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 2: Cleanup soft-deleted resources (Key Vault) ===" -ForegroundColor Cyan
 
 # Limpiar Key Vaults soft-deleted
 $deletedVault = az keyvault show-deleted --name $vaultName --query "name" -o tsv 2>$null
@@ -95,6 +114,7 @@ Write-Host "`n=== Cleanup complete ===" -ForegroundColor Green
 Write-Host "`nVerifying:" -ForegroundColor Cyan
 az keyvault list-deleted --query "[].name" -o tsv
 
-Write-Host "`n⚠️  NOTE: Other Azure resources (SQL Server, Storage) may also be soft-deleted." -ForegroundColor Yellow
-Write-Host "   If you can't recreate them, check:" -ForegroundColor Gray
-Write-Host '   az keyvault list-deleted --query "[].{name:name, location:properties.location}" -o table'  -ForegroundColor Gray
+Write-Host "`n⚠️  NOTE: Shared infrastructure (rg-main-shared, acrmain, law-main) was NOT destroyed." -ForegroundColor Green
+Write-Host "   To destroy shared resources use: .\destroy-all.ps1 -DestroyShared" -ForegroundColor Yellow
+Write-Host "`nOther Azure resources (SQL Server, etc.) may be soft-deleted. Check with:" -ForegroundColor Gray
+Write-Host '   az keyvault list-deleted --query "[].{name:name, location:properties.location}" -o table' -ForegroundColor Gray

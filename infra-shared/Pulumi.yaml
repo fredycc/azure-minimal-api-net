@@ -1,0 +1,3 @@
+name: azure-minimal-api-net-shared
+runtime: dotnet
+description: Shared infrastructure (ACR + Log Analytics Workspace) for multi-environment deployment of azure-minimal-api-net

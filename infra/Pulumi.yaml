@@ -1,3 +1,5 @@
 name: doctors-api-infra
+# Note: This project name is used in StackReference(".../doctors-api-infra/{stack}").
+# The shared stack uses "azure-minimal-api-net-shared" as defined in infra-shared/Pulumi.yaml.
 runtime: dotnet
 description: Infrastructure for the Specialist Doctors CRUD API

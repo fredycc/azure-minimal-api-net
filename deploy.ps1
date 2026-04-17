@@ -90,9 +90,13 @@
 #>
 
 param(
-    [string]$Tag = "latest",
-    [string]$Env = "dev"
+    [string]$Tag = 'latest',
+    [ValidateSet('dev','qa','prod')]
+    [string]$Env,
+    [switch]$DeployShared
 )
+
+if (-not $Env) { Write-Error 'Debe especificar el ambiente explícitamente: .\deploy.ps1 -Env dev|qa|prod'; exit 1 }
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -100,7 +104,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$AcrName   = "acrdoctorsapi$Env"
+# Multi-stage shared ACR (acrfcoremain) - no longer per-environment
+$AcrName   = "acrfcoremain"
 $RgName    = "rg-doctors-$Env"
 $CaName    = "ca-doctors-api-$Env"
 $CaeName   = "cae-doctors-api-$Env"
@@ -111,7 +116,33 @@ $ImageName = "$AcrName.azurecr.io/doctors-api:$Tag"
 # PRE-CHECKS
 # ──────────────────────────────────────────────────────────────
 
-Write-Host "=== Pre-checks ===" -ForegroundColor Cyan
+Write-Host "=== Multi-Stage Deployment (Shared + $Env) ===" -ForegroundColor Cyan
+
+# Deploy shared infrastructure first if requested or if it doesn't exist
+if ($DeployShared) {
+    Write-Host "  Deploying shared infrastructure (ACR + LAW)..." -ForegroundColor Yellow
+    pulumi up --cwd infra-shared --stack main --refresh --yes
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Shared infrastructure deployment failed"
+        exit 1
+    }
+    Write-Host "  Shared infrastructure deployed successfully" -ForegroundColor Green
+} else {
+    Write-Host "  Verificando dependencias compartidas..." -ForegroundColor Cyan
+    $checkAcr = pulumi stack output acrName --cwd infra-shared --stack main 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($checkAcr)) {
+        Write-Host "
+[ERROR] FALTA INFRAESTRUCTURA COMPARTIDA." -ForegroundColor Red
+        Write-Host "El entorno '$Env' depende de recursos core (ACR, Log Analytics) que aun no se han creado." -ForegroundColor Yellow
+        Write-Host "Para solucionarlo, ejecuta el comando incluyendo el flag -DeployShared:
+" -ForegroundColor Yellow
+        Write-Host "    .\deploy.ps1 -DeployShared -Env $Env
+" -ForegroundColor Green
+        exit 1
+    }
+}
+
+Write-Host "`n=== Pre-checks ===" -ForegroundColor Cyan
 
 try { docker info *>$null } catch {
     Write-Error "Docker Desktop no está corriendo. Inicialo y volvé a intentar."
@@ -154,21 +185,19 @@ if (-not $env:PULUMI_CONFIG_PASSPHRASE -and -not $env:PULUMI_CONFIG_PASSPHRASE_F
 }
 
 # ──────────────────────────────────────────────────────────────
-# PASO 1: INFRAESTRUCTURA BASE (Pulumi)
+# PASO 1: INFRAESTRUCTURA POR ENTORNO (Pulumi)
 # ──────────────────────────────────────────────────────────────
-# Crea TODA la infra: Resource Group, ACR, SQL Server/DB, Key Vault,
-# Log Analytics, Container App Environment, Container App (placeholder),
-# Diagnostic Settings, KV Secrets, y roles RBAC.
-#
-# El Container App se crea con una imagen placeholder pública y
-# MinReplicas=0 para evitar errores en el primer deploy.
+# Now uses StackReference to shared infra (infra-shared/main).
+# Creates: RG-per-env, SQL (with auto-pause logic), KV, CAE, ContainerApp,
+# RBAC roles (using shared ACR ID), DiagnosticSettings (using shared LAW).
 
-Write-Host "`n=== Step 1: Provision infrastructure ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 1: Provision environment infrastructure ($Env) ===" -ForegroundColor Cyan
 
 $oldPref = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 
-pulumi up --cwd infra --yes
+# Use explicit stack name based on Env (dev, qa, prod)
+pulumi up --cwd infra --stack $Env --refresh --yes
 $exitCode = $LASTEXITCODE
 
 $ErrorActionPreference = $oldPref
@@ -187,11 +216,11 @@ if ($exitCode -ne 0) {
 Write-Host "  Infrastructure provisioned" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────────
-# PASO 2: LOGIN A ACR
+# PASO 2: LOGIN A SHARED ACR
 # ──────────────────────────────────────────────────────────────
-# Autentica Docker contra Azure Container Registry para poder hacer push.
+# Now uses the shared 'acrfcoremain' registry.
 
-Write-Host "`n=== Step 2: Login to ACR ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 2: Login to shared ACR ($AcrName) ===" -ForegroundColor Cyan
 az acr login --name $AcrName
 
 # ──────────────────────────────────────────────────────────────
@@ -225,11 +254,10 @@ Write-Host "  Image pushed to ACR" -ForegroundColor Green
 # ──────────────────────────────────────────────────────────────
 # PASO 5: CONFIGURAR REGISTRY Y ACTUALIZAR IMAGEN DEL CONTAINER APP
 # ──────────────────────────────────────────────────────────────
-# El Container App ya fue creado por Pulumi con una imagen placeholder.
-# Primero configuramos el ACR con la identidad del sistema (necesario para pull).
-# Luego actualizamos la imagen.
+# The Container App was created by Pulumi with placeholder image.
+# We now configure it to use the *shared* ACR.
 
-Write-Host "`n=== Step 5: Configure registry and update Container App image ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 5: Configure registry (shared ACR) and update Container App image ===" -ForegroundColor Cyan
 
 # Configurar el registry con identidad del sistema
 Write-Host "  Configuring ACR registry with system identity..." -ForegroundColor Yellow
