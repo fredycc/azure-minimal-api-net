@@ -295,7 +295,7 @@ Write-Host "  Container App image updated: $ImageName" -ForegroundColor Green
 # ──────────────────────────────────────────────────────────────
 # PASO 6: VERIFICAR DEPLOY
 # ──────────────────────────────────────────────────────────────
-# Espera a que la API responda (máx 120s — SQL serverless puede
+# Espera a que la API responda (max 120s - SQL serverless puede
 # tardar al despertar). Muestra las URLs finales.
 
 Write-Host "`n=== Step 6: Verify deployment ===" -ForegroundColor Cyan
@@ -304,11 +304,11 @@ $url = az containerapp show --name $CaName --resource-group $RgName --query "pro
 
 if (-not $url -or $url -eq "null") {
     Write-Warning "Container App no tiene ingress configurado."
-    Write-Host "  Verificá el estado: az containerapp show --name $CaName --resource-group $RgName --query 'properties.provisioningState' -o tsv"
+    Write-Host "  Verificando el estado: az containerapp show --name $CaName --resource-group $RgName --query 'properties.provisioningState' -o tsv"
 }
 else {
     Write-Host "  Container App URL: https://$url" -ForegroundColor Cyan
-    Write-Host "  Waiting for API to respond... (máx 120s — SQL serverless puede tardar al despertar)" -ForegroundColor Yellow
+    Write-Host "  Waiting for API to respond... (max 120s - SQL serverless puede tardar al despertar)" -ForegroundColor Yellow
 
     $maxRetries = 24
     $apiResponded = $false
@@ -326,7 +326,7 @@ else {
     }
 
     if (-not $apiResponded) {
-        Write-Warning "La API no respondió después de 120 segundos."
+        Write-Warning "La API no respondio despues de 120 segundos."
         Write-Host "`n  Para ver logs del container:" -ForegroundColor Yellow
         Write-Host "    az containerapp logs show --name $CaName --resource-group $RgName --type console --tail 30" -ForegroundColor Gray
     }
