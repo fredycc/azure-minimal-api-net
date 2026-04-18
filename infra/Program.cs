@@ -7,9 +7,9 @@
 //
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARQUITECTURA (orden de creación)                                       ║
-// ║  TWO-TIER MULTI-STAGE DESIGN (new):                                     ║
-// ║    infra-shared (main) → ACR (acrmain) + LAW (law-main) + RG            ║
-// ║    infra-{env}         → RG, SQL, KV, CAE, ContainerApp (per env)       ║
+// ║  TWO-TIER MULTI-STAGE DESIGN:                                           ║
+// ║    infra-shared (main) → ACR + LAW + CAE + RG (shared across envs)      ║
+// ║    infra-{env}         → RG, SQL, KV, ContainerApp (per env)            ║
 // ║                                                                         ║
 // ║  1. Resource Group (per-env)                                            ║
 // ║  2. SQL Server + DB (serverless + auto-pause 60min for non-prod)        ║
@@ -27,10 +27,10 @@
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 //
 // COSTO ESTIMADO (multi-stage):
-//   Shared (always on): ~$7-10/mes (ACR Basic + LAW)
+//   Shared (always on): ~$15-20/mes (ACR Basic + LAW + CAE)
 //   Per-env dev/qa:     ~$8-15/mes (SQL serverless 60min auto-pause)
 //   Prod:               ~$25+/mes (no auto-pause)
-//   Total idle:         ~$15-25/mes
+//   Total idle:         ~$20-35/mes
 //
 // SEGURIDAD:
 //   - Managed Identity en Container App (sin passwords hardcodeadas)
@@ -73,6 +73,7 @@ return await Pulumi.Deployment.RunAsync(() =>
     var acrId = sharedRef.GetOutput("acrId").Apply(x => x!.ToString()!);
     var acrLoginServer = sharedRef.GetOutput("acrLoginServer");
     var lawWorkspaceId = sharedRef.GetOutput("logAnalyticsWorkspaceId").Apply(x => x!.ToString()!);
+    var containerAppEnvironmentId = sharedRef.GetOutput("caeId").Apply(x => x!.ToString()!);
 
     var clientConfig = AzureNative.Authorization.GetClientConfig.Invoke();
     var subscriptionId = clientConfig.Apply(c => c.SubscriptionId); // Para RBAC role definitions
@@ -214,9 +215,9 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     
-    var sqlDatabase = new AzureNative.Sql.Database("sqldb-doctors-$env", new()
+    var sqlDatabase = new AzureNative.Sql.Database($"sqldb-doctors-{env}", new()
     {
-        DatabaseName = "sqldb-doctors-$env",
+        DatabaseName = $"sqldb-doctors-{env}",
         ServerName = sqlServer.Name,
         ResourceGroupName = resourceGroup.Name,
         Location = resourceGroup.Location,
@@ -233,22 +234,15 @@ return await Pulumi.Deployment.RunAsync(() =>
 
 
     // =========================================================================
-    // 7. CONTAINER APP ENVIRONMENT — Entorno donde corren los containers
+    // 7. CONTAINER APP ENVIRONMENT — Referencia al CAE compartido
     // =========================================================================
     //
-    // El CAE agrupa Container Apps y comparte configuración de red y logging.
+    // Compartimos un solo Container App Environment (cae-core-main) desde
+    // el stack infra-shared. Esto optimiza recursos y nos evita el límite
+    // de 1 CAE por suscripción que tienen algunas regiones de Azure.
     //
-    // IMPORTANTE: Environment StaticIp (4.242.120.1) es la IP de INGRESS
-    // (lo que entra). La IP de OUTBOUND (lo que sale, ej: SQL) es DIFERENTE
-    // y se obtiene del Container App.OutboundIpAddresses.
+    // El ID de este CAE ya se obtuvo de sharedRef al inicio del script.
     //
-    var containerAppEnvironment = new AzureNative.App.ManagedEnvironment($"cae-doctors-api-{env}", new()
-    {
-        EnvironmentName = $"cae-doctors-api-{env}",
-        ResourceGroupName = resourceGroup.Name,
-        Location = resourceGroup.Location,
-        Tags = tags,
-    });
 
     // =========================================================================
     // 8. KEY VAULT — Almacena secrets (RBAC mode)
@@ -362,7 +356,7 @@ return await Pulumi.Deployment.RunAsync(() =>
         ContainerAppName = $"ca-doctors-api-{env}",
         ResourceGroupName = resourceGroup.Name,
         Location = resourceGroup.Location,
-        EnvironmentId = containerAppEnvironment.Id,
+        EnvironmentId = containerAppEnvironmentId,
         Identity = new AzureNative.App.Inputs.ManagedServiceIdentityArgs
         {
             Type = AzureNative.App.ManagedServiceIdentityType.SystemAssigned,

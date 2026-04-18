@@ -58,7 +58,43 @@ return await Pulumi.Deployment.RunAsync(() =>
     });
 
     // =========================================================================
-    // OUTPUTS — Used by environment stacks via StackReference
+    // 4. SHARED CONTAINER APP ENVIRONMENT (cae-core-main)
+    // =========================================================================
+    // Azure restricts Container App Environments in some subscriptions.
+    // Sharing one across environments saves costs and avoids limits.
+    
+    // Obtenemos las credenciales (SharedKey) del Log Analytics Workspace para asociarlas al CAE.
+    var sharedKey = Output.Tuple(resourceGroup.Name, logAnalytics.Name).Apply(names =>
+    {
+        var rgName = names.Item1;
+        var lawName = names.Item2;
+        var keys = AzureNative.OperationalInsights.GetSharedKeys.Invoke(new AzureNative.OperationalInsights.GetSharedKeysInvokeArgs
+        {
+            ResourceGroupName = rgName,
+            WorkspaceName = lawName,
+        });
+        return keys.Apply(k => k.PrimarySharedKey ?? string.Empty);
+    });
+
+    var cae = new AzureNative.App.ManagedEnvironment("cae-core-main", new()
+    {
+        EnvironmentName = "cae-core-main",
+        ResourceGroupName = resourceGroup.Name,
+        Location = resourceGroup.Location,
+        AppLogsConfiguration = new AzureNative.App.Inputs.AppLogsConfigurationArgs
+        {
+            Destination = "log-analytics",
+            LogAnalyticsConfiguration = new AzureNative.App.Inputs.LogAnalyticsConfigurationArgs
+            {
+                CustomerId = logAnalytics.CustomerId,
+                SharedKey = sharedKey,
+            }
+        },
+        Tags = tags,
+    });
+
+    // =========================================================================
+    // OUTPUTS - Used by environment stacks via StackReference
     // =========================================================================
     return new Dictionary<string, object?>
     {
@@ -66,6 +102,7 @@ return await Pulumi.Deployment.RunAsync(() =>
         ["acrId"] = acr.Id,                    // Required for RBAC AcrPull
         ["acrLoginServer"] = Output.Format($"{acr.Name}.azurecr.io"),
         ["logAnalyticsWorkspaceId"] = logAnalytics.Id,
+        ["caeId"] = cae.Id,
         ["resourceGroupName"] = resourceGroup.Name,
     };
 });

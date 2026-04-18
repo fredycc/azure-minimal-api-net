@@ -237,90 +237,86 @@ azure-minimal-api-net/
 
 The project uses a **Two-Tier Infrastructure** strategy via Pulumi `StackReference` to separate global resources from environment-specific ones. This ensures cost-efficiency, avoids global naming conflicts, and provides stability across stages.
 
-```mermaid
-graph TD
-    subgraph Shared[infra-shared / main]
-        RG_Shared[rg-core-shared]
-        ACR[acrfcoremain<br>Azure Container Registry]
-        LAW[law-core-main<br>Log Analytics Workspace]
-        RG_Shared --> ACR
-        RG_Shared --> LAW
-    end
+  ```mermaid
+  graph TD
+      subgraph Shared[infra-shared / main]
+          RG_Shared[rg-core-shared]
+          ACR[acrfcoremain<br>Azure Container Registry]
+          LAW[law-core-main<br>Log Analytics Workspace]
+          CAE_Shared[cae-core-main<br>Container App Environment]
+          RG_Shared --> ACR
+          RG_Shared --> LAW
+          RG_Shared --> CAE_Shared
+          CAE_Shared -. "sends logs to" .-> LAW
+      end
 
-    subgraph Dev[infra / dev]
-        RG_Dev[rg-doctors-dev]
-        SQL_Dev[(sql-doctors-api-dev<br>SQL Serverless<br>60m auto-pause)]
-        DB_Dev[(sqldb-doctors-dev)]
-        CAE_Dev[cae-doctors-api-dev<br>Container App Environment]
-        KV_Dev[kv-doctors-api-dev<br>Key Vault + Secrets]
-        CA_Dev[ca-doctors-api-dev<br>ASPNETCORE_ENVIRONMENT=Development]
-        DIAG_Dev[diag-sql-dev + diag-kv-dev<br>DiagnosticSettings *]
+      subgraph Dev[infra / dev]
+          RG_Dev[rg-doctors-dev]
+          SQL_Dev[(sql-doctors-api-dev<br>SQL Serverless<br>60m auto-pause)]
+          DB_Dev[(sqldb-doctors-dev)]
+          KV_Dev[kv-doctors-api-dev<br>Key Vault + Secrets]
+          CA_Dev[ca-doctors-api-dev<br>ASPNETCORE_ENVIRONMENT=Development]
+          DIAG_Dev[diag-sql-dev + diag-kv-dev<br>DiagnosticSettings *]
 
-        RG_Dev --> SQL_Dev
-        SQL_Dev --> DB_Dev
-        RG_Dev --> CAE_Dev
-        RG_Dev --> KV_Dev
-        CAE_Dev --> CA_Dev
-        CA_Dev -. "reads secrets" .-> KV_Dev
-    end
+          RG_Dev --> SQL_Dev
+          SQL_Dev --> DB_Dev
+          RG_Dev --> KV_Dev
+          CAE_Shared --> CA_Dev
+          CA_Dev -. "reads secrets" .-> KV_Dev
+      end
 
-    subgraph QA[infra / qa]
-        RG_QA[rg-doctors-qa]
-        SQL_QA[(sql-doctors-api-qa<br>SQL Serverless<br>60m auto-pause)]
-        DB_QA[(sqldb-doctors-qa)]
-        CAE_QA[cae-doctors-api-qa<br>Container App Environment]
-        KV_QA[kv-doctors-api-qa<br>Key Vault + Secrets]
-        CA_QA[ca-doctors-api-qa<br>ASPNETCORE_ENVIRONMENT=Production]
-        DIAG_QA[diag-sql-qa + diag-kv-qa<br>DiagnosticSettings *]
+      subgraph QA[infra / qa]
+          RG_QA[rg-doctors-qa]
+          SQL_QA[(sql-doctors-api-qa<br>SQL Serverless<br>60m auto-pause)]
+          DB_QA[(sqldb-doctors-qa)]
+          KV_QA[kv-doctors-api-qa<br>Key Vault + Secrets]
+          CA_QA[ca-doctors-api-qa<br>ASPNETCORE_ENVIRONMENT=Production]
+          DIAG_QA[diag-sql-qa + diag-kv-qa<br>DiagnosticSettings *]
 
-        RG_QA --> SQL_QA
-        SQL_QA --> DB_QA
-        RG_QA --> CAE_QA
-        RG_QA --> KV_QA
-        CAE_QA --> CA_QA
-        CA_QA -. "reads secrets" .-> KV_QA
-    end
+          RG_QA --> SQL_QA
+          SQL_QA --> DB_QA
+          RG_QA --> KV_QA
+          CAE_Shared --> CA_QA
+          CA_QA -. "reads secrets" .-> KV_QA
+      end
 
-    subgraph Prod[infra / prod]
-        RG_Prod[rg-doctors-prod]
-        SQL_Prod[(sql-doctors-api-prod<br>SQL Serverless<br>no auto-pause)]
-        DB_Prod[(sqldb-doctors-prod)]
-        CAE_Prod[cae-doctors-api-prod<br>Container App Environment]
-        KV_Prod[kv-doctors-api-prod<br>Key Vault + Secrets]
-        CA_Prod[ca-doctors-api-prod<br>ASPNETCORE_ENVIRONMENT=Production]
-        DIAG_Prod[diag-sql-prod + diag-kv-prod<br>DiagnosticSettings *]
+      subgraph Prod[infra / prod]
+          RG_Prod[rg-doctors-prod]
+          SQL_Prod[(sql-doctors-api-prod<br>SQL Serverless<br>no auto-pause)]
+          DB_Prod[(sqldb-doctors-prod)]
+          KV_Prod[kv-doctors-api-prod<br>Key Vault + Secrets]
+          CA_Prod[ca-doctors-api-prod<br>ASPNETCORE_ENVIRONMENT=Production]
+          DIAG_Prod[diag-sql-prod + diag-kv-prod<br>DiagnosticSettings *]
 
-        RG_Prod --> SQL_Prod
-        SQL_Prod --> DB_Prod
-        RG_Prod --> CAE_Prod
-        RG_Prod --> KV_Prod
-        CAE_Prod --> CA_Prod
-        CA_Prod -. "reads secrets" .-> KV_Prod
-    end
+          RG_Prod --> SQL_Prod
+          SQL_Prod --> DB_Prod
+          RG_Prod --> KV_Prod
+          CAE_Shared --> CA_Prod
+          CA_Prod -. "reads secrets" .-> KV_Prod
+      end
 
-    CA_Dev -. "pulls image" .-> ACR
-    CA_QA -. "pulls image" .-> ACR
-    CA_Prod -. "pulls image" .-> ACR
-    DIAG_Dev -. "logs" .-> LAW
-    DIAG_QA -. "logs" .-> LAW
-    DIAG_Prod -. "logs" .-> LAW
-```
+      CA_Dev -. "pulls image" .-> ACR
+      CA_QA -. "pulls image" .-> ACR
+      CA_Prod -. "pulls image" .-> ACR
+      DIAG_Dev -. "logs" .-> LAW
+      DIAG_QA -. "logs" .-> LAW
+      DIAG_Prod -. "logs" .-> LAW
+  ```
 
 > `*` DiagnosticSettings solo se crean cuando `costMode` es `normal` o `full`. En `nano`/`mini` se omiten para ahorrar ~$2-5/mes.
 
-1.  **Shared Infrastructure (`infra-shared` / `main`)**:
-    *   **Purpose**: Resources shared across all environments to avoid duplication, reduce costs, and avoid global Azure naming conflicts.
-    *   **Resources**: `rg-core-shared` (Resource Group), `acrfcoremain` (Container Registry, Basic SKU), `law-core-main` (Log Analytics Workspace).
-2.  **Environment Infrastructure (`infra` / `{env}`)**:
-    *   **Purpose**: Fully isolated resources per stage (`dev`, `qa`, `prod`).
-    *   **Resources per env**:
-        *   `rg-doctors-{env}` — Resource Group
-        *   `sql-doctors-api-{env}` + `sqldb-doctors-{env}` — SQL Serverless (auto-pause 60min en dev/qa, siempre activo en prod)
-        *   `cae-doctors-api-{env}` — Container App Environment
-        *   `kv-doctors-api-{env}` — Key Vault (RBAC) con secrets: connection string + JWT signing key
-        *   `ca-doctors-api-{env}` — Container App (Dev: `ASPNETCORE_ENVIRONMENT=Development`, QA/Prod: `Production`)
-        *   `diag-sql-{env}` + `diag-kv-{env}` — DiagnosticSettings → Log Analytics (solo en `costMode: normal/full`)
-    *   **Reference**: Usa `StackReference("organization/azure-minimal-api-net-shared/main")` para obtener ACR y LAW del shared stack.
+  1.  **Shared Infrastructure (`infra-shared` / `main`)**:
+      *   **Purpose**: Resources shared across all environments to avoid duplication, reduce costs, bypass Azure subscription limits (e.g., 1 CAE per region), and avoid global Azure naming conflicts.
+      *   **Resources**: `rg-core-shared` (Resource Group), `acrfcoremain` (Container Registry, Basic SKU), `law-core-main` (Log Analytics Workspace), `cae-core-main` (Container App Environment).
+  2.  **Environment Infrastructure (`infra` / `{env}`)**:
+      *   **Purpose**: Fully isolated resources per stage (`dev`, `qa`, `prod`).
+      *   **Resources per env**:
+          *   `rg-doctors-{env}` - Resource Group
+          *   `sql-doctors-api-{env}` + `sqldb-doctors-{env}` - SQL Serverless (auto-pause 60min en dev/qa, siempre activo en prod)
+          *   `kv-doctors-api-{env}` - Key Vault (RBAC) con secrets: connection string + JWT signing key
+          *   `ca-doctors-api-{env}` - Container App (Dev: `ASPNETCORE_ENVIRONMENT=Development`, QA/Prod: `Production`)
+          *   `diag-sql-{env}` + `diag-kv-{env}` - DiagnosticSettings -> Log Analytics (solo en `costMode: normal/full`)
+      *   **Reference**: Usa `StackReference("organization/azure-minimal-api-net-shared/main")` para obtener ACR, LAW y el CAE del shared stack.
 
 ### Deploying to Different Environments
 

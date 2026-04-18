@@ -51,28 +51,32 @@
     LastEdit:  2026-04-03
 
     Azure Resources created by Pulumi:
-        rg-doctors-api-dev          Resource Group (westus2)
-        ├── acrdoctorsapidev        Container Registry (Basic, no admin)
-        ├── law-doctors-api-dev     Log Analytics Workspace (PerGB2018)
-        ├── sql-doctors-api-dev     SQL Server
-        │   ├── sqldb-doctors-dev   SQL Database (Serverless, auto-pause 60min)
+        SHARED (infra-shared/main):
+        ├── rg-core-shared          Resource Group (shared)
+        ├── acrfcoremain            Container Registry (Basic, no admin)
+        ├── law-core-main           Log Analytics Workspace (PerGB2018)
+        └── cae-core-main           Container App Environment (shared, 1 per region)
+
+        PER-ENV (infra/{env}):
+        rg-doctors-{env}            Resource Group (westus2)
+        ├── sql-doctors-api-{env}   SQL Server
+        │   ├── sqldb-doctors-{env} SQL Database (Serverless, auto-pause 60min)
         │   ├── fw-allow-azure      Firewall: AllowAzureServices (0.0.0.0)
         │   └── AllowContainerApp   Firewall: Container App outbound IP
-        ├── kv-doctors-api-dev      Key Vault (RBAC mode)
-        │   ├── sql-conn-dev        Connection string secret
-        │   └── jwt-signing-key-dev JWT signing key secret
-        ├── cae-doctors-api-dev     Container App Environment
-        ├── ca-doctors-api-dev      Container App (placeholder image, MinReplicas=0)
+        ├── kv-doctors-api-{env}    Key Vault (RBAC mode)
+        │   ├── sql-conn-{env}      Connection string secret
+        │   └── jwt-signing-key-{env} JWT signing key secret
+        ├── ca-doctors-api-{env}    Container App (placeholder image, MinReplicas=0)
         │   ├── SystemAssigned Managed Identity
-        │   ├── AcrPull role → ACR
+        │   ├── AcrPull role → ACR (shared)
         │   └── KeyVaultSecretsUser role → KV
-        ├── diag-sql-dev            DiagnosticSettings → Log Analytics
-        └── diag-kv-dev             DiagnosticSettings → Log Analytics
+        ├── diag-sql-{env}          DiagnosticSettings → Log Analytics
+        └── diag-kv-{env}           DiagnosticSettings → Log Analytics
 
     Azure Resources updated by deploy.ps1:
         └── ca-doctors-api-dev      Container App (image update only)
 
-    Estimated cost: ~$10/mes idle, ~$15-20/mes with traffic
+    Estimated cost: ~$20/mes idle (shared CAE + ACR + LAW), ~$30-40/mes with traffic
 
     Security features:
         - Managed Identity on Container App (no hardcoded passwords)
@@ -108,7 +112,7 @@ $ErrorActionPreference = "Stop"
 $AcrName   = "acrfcoremain"
 $RgName    = "rg-doctors-$Env"
 $CaName    = "ca-doctors-api-$Env"
-$CaeName   = "cae-doctors-api-$Env"
+$CaeName   = "cae-core-main"  # Shared CAE from infra-shared
 $KvName    = "kv-doctors-api-$Env"
 $ImageName = "$AcrName.azurecr.io/doctors-api:$Tag"
 
@@ -120,7 +124,7 @@ Write-Host "=== Multi-Stage Deployment (Shared + $Env) ===" -ForegroundColor Cya
 
 # Deploy shared infrastructure first if requested or if it doesn't exist
 if ($DeployShared) {
-    Write-Host "  Deploying shared infrastructure (ACR + LAW)..." -ForegroundColor Yellow
+    Write-Host "  Deploying shared infrastructure (ACR + LAW + CAE)..." -ForegroundColor Yellow
     pulumi up --cwd infra-shared --stack main --refresh --yes
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Shared infrastructure deployment failed"

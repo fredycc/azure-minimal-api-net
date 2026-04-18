@@ -1,1 +1,3 @@
 encryptionsalt: v1:16U3IUkzRuQ=:v1:LQmUzdipPc6SVHzP:kLQeX13QH1dyS/OrTD78vGHJKW5VoQ==
+config:
+  azure-minimal-api-net-shared:location: westus2
