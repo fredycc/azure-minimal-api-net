@@ -104,5 +104,6 @@ return await Pulumi.Deployment.RunAsync(() =>
         ["logAnalyticsWorkspaceId"] = logAnalytics.Id,
         ["caeId"] = cae.Id,
         ["resourceGroupName"] = resourceGroup.Name,
+        ["location"] = location,
     };
 });

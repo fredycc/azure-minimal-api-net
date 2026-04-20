@@ -306,7 +306,7 @@ The project uses a **Two-Tier Infrastructure** strategy via Pulumi `StackReferen
 > `*` DiagnosticSettings solo se crean cuando `costMode` es `normal` o `full`. En `nano`/`mini` se omiten para ahorrar ~$2-5/mes.
 
   1.  **Shared Infrastructure (`infra-shared` / `main`)**:
-      *   **Purpose**: Resources shared across all environments to avoid duplication, reduce costs, bypass Azure subscription limits (e.g., 1 CAE per region), and avoid global Azure naming conflicts.
+      *   **Purpose**: Resources shared across all environments to avoid duplication, reduce costs, bypass Azure subscription limits (e.g., 1 CAE per region), and avoid global Azure naming conflicts. This stack also holds global configurations like `location`.
       *   **Resources**: `rg-core-shared` (Resource Group), `acrfcoremain` (Container Registry, Basic SKU), `law-core-main` (Log Analytics Workspace), `cae-core-main` (Container App Environment).
   2.  **Environment Infrastructure (`infra` / `{env}`)**:
       *   **Purpose**: Fully isolated resources per stage (`dev`, `qa`, `prod`).
@@ -316,7 +316,7 @@ The project uses a **Two-Tier Infrastructure** strategy via Pulumi `StackReferen
           *   `kv-doctors-api-{env}` - Key Vault (RBAC) con secrets: connection string + JWT signing key
           *   `ca-doctors-api-{env}` - Container App (Dev: `ASPNETCORE_ENVIRONMENT=Development`, QA/Prod: `Production`)
           *   `diag-sql-{env}` + `diag-kv-{env}` - DiagnosticSettings -> Log Analytics (solo en `costMode: normal/full`)
-      *   **Reference**: Usa `StackReference("organization/azure-minimal-api-net-shared/main")` para obtener ACR, LAW y el CAE del shared stack.
+      *   **Reference**: Usa `StackReference("organization/azure-minimal-api-net-shared/main")` para obtener ACR, LAW, el CAE y el `location` del shared stack.
 
 ### Deploying to Different Environments
 

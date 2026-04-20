@@ -32,7 +32,6 @@ config:
   doctors-api-infra:env: qa
   doctors-api-infra:sqlAdmin: doctorsadmin
   doctors-api-infra:tenantId: "c9bcaf84-7cff-41a8-8822-bbc098f96b7a"
-  doctors-api-infra:location: westus2
   doctors-api-infra:costMode: mini
   doctors-api-infra:imageTag: qa-latest
   doctors-api-infra:sqlPassword:

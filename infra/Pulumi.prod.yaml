@@ -19,7 +19,6 @@ config:
   doctors-api-infra:env: prod
   doctors-api-infra:sqlAdmin: prodadmin
   doctors-api-infra:tenantId: "c9bcaf84-7cff-41a8-8822-bbc098f96b7a"
-  doctors-api-infra:location: eastus
   doctors-api-infra:costMode: normal
   doctors-api-infra:imageTag: prod-v1.0.0
   doctors-api-infra:sqlPassword:

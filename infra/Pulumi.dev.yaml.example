@@ -21,7 +21,6 @@ config:
   doctors-api-infra:env: dev
   doctors-api-infra:sqlAdmin: doctorsadmin
   doctors-api-infra:tenantId: "<your-azure-tenant-id>"
-  doctors-api-infra:location: westus2
   doctors-api-infra:imageTag: latest
   doctors-api-infra:sqlPassword:
     secure: <set-with-pulumi-config-set--secret>

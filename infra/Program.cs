@@ -61,7 +61,6 @@ return await Pulumi.Deployment.RunAsync(() =>
     var sqlAdmin = config.Require("sqlAdmin");           // Usuario admin del SQL Server
     var sqlPassword = config.RequireSecret("sqlPassword"); // Password del SQL (encriptado en state)
     var tenantId = config.Require("tenantId");           // Azure AD Tenant ID
-    var location = config.Get("location") ?? "eastus";  // Región Azure (default: eastus)
     var costMode = config.Get("costMode") ?? "nano";    // Modo de costo: nano, mini, normal, full
 
     // =========================================================================
@@ -74,6 +73,7 @@ return await Pulumi.Deployment.RunAsync(() =>
     var acrLoginServer = sharedRef.GetOutput("acrLoginServer");
     var lawWorkspaceId = sharedRef.GetOutput("logAnalyticsWorkspaceId").Apply(x => x!.ToString()!);
     var containerAppEnvironmentId = sharedRef.GetOutput("caeId").Apply(x => x!.ToString()!);
+    var location = sharedRef.GetOutput("location").Apply(x => x!.ToString()!);
 
     var clientConfig = AzureNative.Authorization.GetClientConfig.Invoke();
     var subscriptionId = clientConfig.Apply(c => c.SubscriptionId); // Para RBAC role definitions
